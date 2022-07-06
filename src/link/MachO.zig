@@ -1014,12 +1014,12 @@ pub fn flushModule(self: *MachO, comp: *Compilation, prog_node: *std.Progress.No
         }
 
         try self.resolveSymbolsInArchives();
-        // try self.resolveDyldStubBinder();
-        // try self.createDyldPrivateAtom();
-        // try self.createStubHelperPreambleAtom();
+        try self.resolveDyldStubBinder();
+        try self.createDyldPrivateAtom();
+        try self.createStubHelperPreambleAtom();
         try self.resolveSymbolsInDylibs();
         try self.createDsoHandleSymbol();
-        // try self.addCodeSignatureLC();
+        try self.addCodeSignatureLC();
         self.logSymtab();
         return error.TODO;
 
@@ -2368,7 +2368,7 @@ fn createDyldPrivateAtom(self: *MachO) !void {
     };
     if (self.needs_prealloc) {
         const vaddr = try self.allocateAtom(atom, @sizeOf(u64), 8, match);
-        log.debug("allocated {s} atom at 0x{x}", .{ self.getString(sym.n_strx), vaddr });
+        log.debug("allocated dyld private atom at 0x{x}", .{vaddr});
         sym.n_value = vaddr;
     } else try self.addAtomToSection(atom, match);
 
@@ -2425,7 +2425,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             atom.code.items[10] = 0x25;
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 11,
-                .target = .{ .global = self.undefs.items[self.dyld_stub_binder_index.?].n_strx },
+                .target = .{ .global = self.locals.items[self.dyld_stub_binder_index.?].n_strx },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = true,
@@ -2468,7 +2468,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             mem.writeIntLittle(u32, atom.code.items[12..][0..4], aarch64.Instruction.adrp(.x16, 0).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 12,
-                .target = .{ .global = self.undefs.items[self.dyld_stub_binder_index.?].n_strx },
+                .target = .{ .global = self.locals.items[self.dyld_stub_binder_index.?].n_strx },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = true,
@@ -2483,7 +2483,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             ).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 16,
-                .target = .{ .global = self.undefs.items[self.dyld_stub_binder_index.?].n_strx },
+                .target = .{ .global = self.locals.items[self.dyld_stub_binder_index.?].n_strx },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = false,
@@ -2504,7 +2504,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
     if (self.needs_prealloc) {
         const alignment_pow_2 = try math.powi(u32, 2, atom.alignment);
         const vaddr = try self.allocateAtom(atom, atom.size, alignment_pow_2, match);
-        log.debug("allocated {s} atom at 0x{x}", .{ self.getString(sym.n_strx), vaddr });
+        log.debug("allocated stub helper preamble atom at 0x{x}", .{vaddr});
         sym.n_value = vaddr;
     } else try self.addAtomToSection(atom, match);
 
@@ -2937,21 +2937,22 @@ fn resolveDyldStubBinder(self: *MachO) !void {
     if (self.dyld_stub_binder_index != null) return;
     if (self.unresolved.count() == 0) return; // no need for a stub binder if we don't have any imports
 
-    const n_strx = try self.strtab.insert("dyld_stub_binder");
-    const sym_index = @intCast(u32, self.undefs.items.len);
-    try self.undefs.append(self.base.allocator, .{
+    const gpa = self.base.allocator;
+    const n_strx = try self.strtab.insert(gpa, "dyld_stub_binder");
+    const sym_index = @intCast(u32, self.locals.items.len);
+    try self.locals.append(gpa, .{
         .n_strx = n_strx,
         .n_type = macho.N_UNDF,
         .n_sect = 0,
         .n_desc = 0,
         .n_value = 0,
     });
-    try self.symbol_resolver.putNoClobber(self.base.allocator, n_strx, .{
-        .where = .undef,
-        .where_index = sym_index,
+    const sym_name = try gpa.dupe(u8, "dyld_stub_binder");
+    try self.globals.putNoClobber(gpa, sym_name, .{
+        .sym_index = sym_index,
+        .file = null,
     });
-    const sym = &self.undefs.items[sym_index];
-    const sym_name = self.getString(n_strx);
+    const sym = &self.locals.items[sym_index];
 
     for (self.dylibs.items) |dylib, id| {
         if (!dylib.symbols.contains(sym_name)) continue;
@@ -2989,7 +2990,7 @@ fn resolveDyldStubBinder(self: *MachO) !void {
 
     if (self.needs_prealloc) {
         const vaddr = try self.allocateAtom(atom, @sizeOf(u64), 8, match);
-        log.debug("allocated {s} atom at 0x{x}", .{ self.getString(sym.n_strx), vaddr });
+        log.debug("allocated {s} atom at 0x{x}", .{ sym_name, vaddr });
         atom_sym.n_value = vaddr;
     } else try self.addAtomToSection(atom, match);
 
