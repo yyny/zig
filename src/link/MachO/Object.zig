@@ -47,7 +47,7 @@ dwarf_debug_line_index: ?u16 = null,
 dwarf_debug_line_str_index: ?u16 = null,
 dwarf_debug_ranges_index: ?u16 = null,
 
-symtab: []const macho.nlist_64 = &.{},
+symtab: std.ArrayListUnmanaged(macho.nlist_64) = .{},
 strtab: []const u8 = &.{},
 data_in_code_entries: []const macho.data_in_code_entry = &.{},
 
@@ -327,7 +327,7 @@ pub fn parse(self: *Object, allocator: Allocator, target: std.Target) !void {
         self.load_commands.appendAssumeCapacity(cmd);
     }
 
-    self.parseSymtab();
+    try self.parseSymtab(allocator);
     self.parseDataInCode();
     try self.parseDebugInfo(allocator);
 }
@@ -423,10 +423,10 @@ pub fn parseIntoAtoms(self: *Object, allocator: Allocator, macho_file: *MachO) !
     // local < extern defined < undefined. Unfortunately, this is not guaranteed! For instance,
     // the GO compiler does not necessarily respect that therefore we sort immediately by type
     // and address within.
-    var sorted_all_nlists = try std.ArrayList(NlistWithIndex).initCapacity(allocator, self.symtab.len);
+    var sorted_all_nlists = try std.ArrayList(NlistWithIndex).initCapacity(allocator, self.symtab.items.len);
     defer sorted_all_nlists.deinit();
 
-    for (self.symtab) |nlist, index| {
+    for (self.symtab.items) |nlist, index| {
         sorted_all_nlists.appendAssumeCapacity(.{
             .nlist = nlist,
             .index = @intCast(u32, index),
@@ -731,12 +731,15 @@ fn parseIntoAtom(
     try self.contained_atoms.append(allocator, atom);
 }
 
-fn parseSymtab(self: *Object) void {
+fn parseSymtab(self: *Object, allocator: Allocator) !void {
     const index = self.symtab_cmd_index orelse return;
     const symtab = self.load_commands.items[index].symtab;
     const symtab_size = @sizeOf(macho.nlist_64) * symtab.nsyms;
     const raw_symtab = self.contents[symtab.symoff..][0..symtab_size];
-    self.symtab = mem.bytesAsSlice(macho.nlist_64, @alignCast(@alignOf(macho.nlist_64), raw_symtab));
+    try self.symtab.appendSlice(allocator, mem.bytesAsSlice(
+        macho.nlist_64,
+        @alignCast(@alignOf(macho.nlist_64), raw_symtab),
+    ));
     self.strtab = self.contents[symtab.stroff..][0..symtab.strsize];
 }
 

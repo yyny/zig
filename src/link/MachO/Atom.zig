@@ -16,7 +16,7 @@ const Arch = std.Target.Cpu.Arch;
 const Dwarf = @import("../Dwarf.zig");
 const MachO = @import("../MachO.zig");
 const Object = @import("Object.zig");
-const StringIndexAdapter = std.hash_map.StringIndexAdapter;
+const SymbolWithLoc = MachO.SymbolWithLoc;
 
 /// Each decl always gets a local symbol with the fully qualified name.
 /// The vaddr and size are found here directly.
@@ -25,6 +25,9 @@ const StringIndexAdapter = std.hash_map.StringIndexAdapter;
 /// If this field is 0, it means the codegen size = 0 and there is no symbol or
 /// offset table entry.
 local_sym_index: u32,
+
+/// null means symbol defined by Zig source.
+file: ?u32,
 
 /// List of symbols contained within this atom
 contained: std.ArrayListUnmanaged(SymbolAtOffset) = .{},
@@ -169,6 +172,7 @@ pub const Relocation = struct {
 
 pub const empty = Atom{
     .local_sym_index = 0,
+    .file = null,
     .size = 0,
     .alignment = 0,
     .prev = null,
@@ -194,6 +198,24 @@ pub fn clearRetainingCapacity(self: *Atom) void {
     self.relocs.clearRetainingCapacity();
     self.contained.clearRetainingCapacity();
     self.code.clearRetainingCapacity();
+}
+
+pub fn getSymbol(self: Atom, macho_file: *MachO) macho.nlist_64 {
+    return self.getSymbolPtr(macho_file).*;
+}
+
+pub fn getSymbolPtr(self: Atom, macho_file: *MachO) *macho.nlist_64 {
+    return macho_file.getSymbolPtr(.{
+        .sym_index = self.local_sym_index,
+        .file = self.file,
+    });
+}
+
+pub fn getName(self: Atom, macho_file: *MachO) []const u8 {
+    return macho_file.getSymbolName(.{
+        .sym_index = self.local_sym_index,
+        .file = self.file,
+    });
 }
 
 /// Returns how much room there is to grow in virtual address space.
@@ -227,7 +249,7 @@ const RelocContext = struct {
     base_addr: u64 = 0,
     base_offset: i32 = 0,
     allocator: Allocator,
-    object: *Object,
+    object_id: u32,
     macho_file: *MachO,
 };
 
@@ -235,236 +257,241 @@ pub fn parseRelocs(self: *Atom, relocs: []const macho.relocation_info, context: 
     const tracy = trace(@src());
     defer tracy.end();
 
-    const arch = context.macho_file.base.options.target.cpu.arch;
-    var addend: i64 = 0;
-    var subtractor: ?u32 = null;
+    const object = &context.macho_file.objects[context.object_id];
+    _ = relocs;
+    _ = object;
+    _ = self;
 
-    for (relocs) |rel, i| {
-        blk: {
-            switch (arch) {
-                .aarch64 => switch (@intToEnum(macho.reloc_type_arm64, rel.r_type)) {
-                    .ARM64_RELOC_ADDEND => {
-                        assert(addend == 0);
-                        addend = rel.r_symbolnum;
-                        // Verify that it's followed by ARM64_RELOC_PAGE21 or ARM64_RELOC_PAGEOFF12.
-                        if (relocs.len <= i + 1) {
-                            log.err("no relocation after ARM64_RELOC_ADDEND", .{});
-                            return error.UnexpectedRelocationType;
-                        }
-                        const next = @intToEnum(macho.reloc_type_arm64, relocs[i + 1].r_type);
-                        switch (next) {
-                            .ARM64_RELOC_PAGE21, .ARM64_RELOC_PAGEOFF12 => {},
-                            else => {
-                                log.err("unexpected relocation type after ARM64_RELOC_ADDEND", .{});
-                                log.err("  expected ARM64_RELOC_PAGE21 or ARM64_RELOC_PAGEOFF12", .{});
-                                log.err("  found {s}", .{next});
-                                return error.UnexpectedRelocationType;
-                            },
-                        }
-                        continue;
-                    },
-                    .ARM64_RELOC_SUBTRACTOR => {},
-                    else => break :blk,
-                },
-                .x86_64 => switch (@intToEnum(macho.reloc_type_x86_64, rel.r_type)) {
-                    .X86_64_RELOC_SUBTRACTOR => {},
-                    else => break :blk,
-                },
-                else => unreachable,
-            }
+    // const arch = context.macho_file.base.options.target.cpu.arch;
+    // var addend: i64 = 0;
+    // var subtractor: ?u32 = null;
 
-            assert(subtractor == null);
-            const sym = context.object.symtab[rel.r_symbolnum];
-            if (sym.sect() and !sym.ext()) {
-                subtractor = context.object.symbol_mapping.get(rel.r_symbolnum).?;
-            } else {
-                const sym_name = context.object.getString(sym.n_strx);
-                const n_strx = context.macho_file.strtab_dir.getKeyAdapted(
-                    @as([]const u8, sym_name),
-                    StringIndexAdapter{
-                        .bytes = &context.macho_file.strtab,
-                    },
-                ).?;
-                const resolv = context.macho_file.symbol_resolver.get(n_strx).?;
-                assert(resolv.where == .global);
-                subtractor = resolv.local_sym_index;
-            }
-            // Verify that *_SUBTRACTOR is followed by *_UNSIGNED.
-            if (relocs.len <= i + 1) {
-                log.err("no relocation after *_RELOC_SUBTRACTOR", .{});
-                return error.UnexpectedRelocationType;
-            }
-            switch (arch) {
-                .aarch64 => switch (@intToEnum(macho.reloc_type_arm64, relocs[i + 1].r_type)) {
-                    .ARM64_RELOC_UNSIGNED => {},
-                    else => {
-                        log.err("unexpected relocation type after ARM64_RELOC_ADDEND", .{});
-                        log.err("  expected ARM64_RELOC_UNSIGNED", .{});
-                        log.err("  found {s}", .{@intToEnum(macho.reloc_type_arm64, relocs[i + 1].r_type)});
-                        return error.UnexpectedRelocationType;
-                    },
-                },
-                .x86_64 => switch (@intToEnum(macho.reloc_type_x86_64, relocs[i + 1].r_type)) {
-                    .X86_64_RELOC_UNSIGNED => {},
-                    else => {
-                        log.err("unexpected relocation type after X86_64_RELOC_ADDEND", .{});
-                        log.err("  expected X86_64_RELOC_UNSIGNED", .{});
-                        log.err("  found {s}", .{@intToEnum(macho.reloc_type_x86_64, relocs[i + 1].r_type)});
-                        return error.UnexpectedRelocationType;
-                    },
-                },
-                else => unreachable,
-            }
-            continue;
-        }
+    // for (relocs) |rel, i| {
+    //     blk: {
+    //         switch (arch) {
+    //             .aarch64 => switch (@intToEnum(macho.reloc_type_arm64, rel.r_type)) {
+    //                 .ARM64_RELOC_ADDEND => {
+    //                     assert(addend == 0);
+    //                     addend = rel.r_symbolnum;
+    //                     // Verify that it's followed by ARM64_RELOC_PAGE21 or ARM64_RELOC_PAGEOFF12.
+    //                     if (relocs.len <= i + 1) {
+    //                         log.err("no relocation after ARM64_RELOC_ADDEND", .{});
+    //                         return error.UnexpectedRelocationType;
+    //                     }
+    //                     const next = @intToEnum(macho.reloc_type_arm64, relocs[i + 1].r_type);
+    //                     switch (next) {
+    //                         .ARM64_RELOC_PAGE21, .ARM64_RELOC_PAGEOFF12 => {},
+    //                         else => {
+    //                             log.err("unexpected relocation type after ARM64_RELOC_ADDEND", .{});
+    //                             log.err("  expected ARM64_RELOC_PAGE21 or ARM64_RELOC_PAGEOFF12", .{});
+    //                             log.err("  found {s}", .{next});
+    //                             return error.UnexpectedRelocationType;
+    //                         },
+    //                     }
+    //                     continue;
+    //                 },
+    //                 .ARM64_RELOC_SUBTRACTOR => {},
+    //                 else => break :blk,
+    //             },
+    //             .x86_64 => switch (@intToEnum(macho.reloc_type_x86_64, rel.r_type)) {
+    //                 .X86_64_RELOC_SUBTRACTOR => {},
+    //                 else => break :blk,
+    //             },
+    //             else => unreachable,
+    //         }
 
-        const target = target: {
-            if (rel.r_extern == 0) {
-                const sect_id = @intCast(u16, rel.r_symbolnum - 1);
-                const local_sym_index = context.object.sections_as_symbols.get(sect_id) orelse blk: {
-                    const seg = context.object.load_commands.items[context.object.segment_cmd_index.?].segment;
-                    const sect = seg.sections.items[sect_id];
-                    const match = (try context.macho_file.getMatchingSection(sect)) orelse
-                        unreachable;
-                    const local_sym_index = @intCast(u32, context.macho_file.locals.items.len);
-                    try context.macho_file.locals.append(context.allocator, .{
-                        .n_strx = 0,
-                        .n_type = macho.N_SECT,
-                        .n_sect = @intCast(u8, context.macho_file.section_ordinals.getIndex(match).? + 1),
-                        .n_desc = 0,
-                        .n_value = 0,
-                    });
-                    try context.object.sections_as_symbols.putNoClobber(context.allocator, sect_id, local_sym_index);
-                    break :blk local_sym_index;
-                };
-                break :target Relocation.Target{ .local = local_sym_index };
-            }
+    //         assert(subtractor == null);
+    //         const sym = context.object.symtab.items[rel.r_symbolnum];
+    //         if (sym.sect() and !sym.ext()) {
+    //             subtractor = context.object.symbol_mapping.get(rel.r_symbolnum).?;
+    //         } else {
+    //             const sym_name = context.object.getString(sym.n_strx);
+    //             const n_strx = context.macho_file.strtab_dir.getKeyAdapted(
+    //                 @as([]const u8, sym_name),
+    //                 StringIndexAdapter{
+    //                     .bytes = &context.macho_file.strtab,
+    //                 },
+    //             ).?;
+    //             const resolv = context.macho_file.symbol_resolver.get(n_strx).?;
+    //             assert(resolv.where == .global);
+    //             subtractor = resolv.local_sym_index;
+    //         }
+    //         // Verify that *_SUBTRACTOR is followed by *_UNSIGNED.
+    //         if (relocs.len <= i + 1) {
+    //             log.err("no relocation after *_RELOC_SUBTRACTOR", .{});
+    //             return error.UnexpectedRelocationType;
+    //         }
+    //         switch (arch) {
+    //             .aarch64 => switch (@intToEnum(macho.reloc_type_arm64, relocs[i + 1].r_type)) {
+    //                 .ARM64_RELOC_UNSIGNED => {},
+    //                 else => {
+    //                     log.err("unexpected relocation type after ARM64_RELOC_ADDEND", .{});
+    //                     log.err("  expected ARM64_RELOC_UNSIGNED", .{});
+    //                     log.err("  found {s}", .{@intToEnum(macho.reloc_type_arm64, relocs[i + 1].r_type)});
+    //                     return error.UnexpectedRelocationType;
+    //                 },
+    //             },
+    //             .x86_64 => switch (@intToEnum(macho.reloc_type_x86_64, relocs[i + 1].r_type)) {
+    //                 .X86_64_RELOC_UNSIGNED => {},
+    //                 else => {
+    //                     log.err("unexpected relocation type after X86_64_RELOC_ADDEND", .{});
+    //                     log.err("  expected X86_64_RELOC_UNSIGNED", .{});
+    //                     log.err("  found {s}", .{@intToEnum(macho.reloc_type_x86_64, relocs[i + 1].r_type)});
+    //                     return error.UnexpectedRelocationType;
+    //                 },
+    //             },
+    //             else => unreachable,
+    //         }
+    //         continue;
+    //     }
 
-            const sym = context.object.symtab[rel.r_symbolnum];
-            const sym_name = context.object.getString(sym.n_strx);
+    //     const target = target: {
+    //         if (rel.r_extern == 0) {
+    //             const sect_id = @intCast(u16, rel.r_symbolnum - 1);
+    //             const local_sym_index = context.object.sections_as_symbols.get(sect_id) orelse blk: {
+    //                 const seg = context.object.load_commands.items[context.object.segment_cmd_index.?].segment;
+    //                 const sect = seg.sections.items[sect_id];
+    //                 const match = (try context.macho_file.getMatchingSection(sect)) orelse
+    //                     unreachable;
+    //                 const local_sym_index = @intCast(u32, context.macho_file.locals.items.len);
+    //                 try context.macho_file.locals.append(context.allocator, .{
+    //                     .n_strx = 0,
+    //                     .n_type = macho.N_SECT,
+    //                     .n_sect = @intCast(u8, context.macho_file.section_ordinals.getIndex(match).? + 1),
+    //                     .n_desc = 0,
+    //                     .n_value = 0,
+    //                 });
+    //                 try context.object.sections_as_symbols.putNoClobber(context.allocator, sect_id, local_sym_index);
+    //                 break :blk local_sym_index;
+    //             };
+    //             break :target Relocation.Target{ .local = local_sym_index };
+    //         }
 
-            if (sym.sect() and !sym.ext()) {
-                const sym_index = context.object.symbol_mapping.get(rel.r_symbolnum) orelse unreachable;
-                break :target Relocation.Target{ .local = sym_index };
-            }
+    //         const sym = context.object.symtab[rel.r_symbolnum];
+    //         const sym_name = context.object.getString(sym.n_strx);
 
-            const n_strx = context.macho_file.strtab_dir.getKeyAdapted(
-                @as([]const u8, sym_name),
-                StringIndexAdapter{
-                    .bytes = &context.macho_file.strtab,
-                },
-            ) orelse unreachable;
-            break :target Relocation.Target{ .global = n_strx };
-        };
-        const offset = @intCast(u32, rel.r_address - context.base_offset);
+    //         if (sym.sect() and !sym.ext()) {
+    //             const sym_index = context.object.symbol_mapping.get(rel.r_symbolnum) orelse unreachable;
+    //             break :target Relocation.Target{ .local = sym_index };
+    //         }
 
-        switch (arch) {
-            .aarch64 => {
-                switch (@intToEnum(macho.reloc_type_arm64, rel.r_type)) {
-                    .ARM64_RELOC_BRANCH26 => {
-                        // TODO rewrite relocation
-                        try addStub(target, context);
-                    },
-                    .ARM64_RELOC_GOT_LOAD_PAGE21,
-                    .ARM64_RELOC_GOT_LOAD_PAGEOFF12,
-                    .ARM64_RELOC_POINTER_TO_GOT,
-                    => {
-                        // TODO rewrite relocation
-                        try addGotEntry(target, context);
-                    },
-                    .ARM64_RELOC_UNSIGNED => {
-                        addend = if (rel.r_length == 3)
-                            mem.readIntLittle(i64, self.code.items[offset..][0..8])
-                        else
-                            mem.readIntLittle(i32, self.code.items[offset..][0..4]);
-                        if (rel.r_extern == 0) {
-                            const seg = context.object.load_commands.items[context.object.segment_cmd_index.?].segment;
-                            const target_sect_base_addr = seg.sections.items[rel.r_symbolnum - 1].addr;
-                            addend -= @intCast(i64, target_sect_base_addr);
-                        }
-                        try self.addPtrBindingOrRebase(rel, target, context);
-                    },
-                    .ARM64_RELOC_TLVP_LOAD_PAGE21,
-                    .ARM64_RELOC_TLVP_LOAD_PAGEOFF12,
-                    => {
-                        if (target == .global) {
-                            try addTlvPtrEntry(target, context);
-                        }
-                    },
-                    else => {},
-                }
-            },
-            .x86_64 => {
-                const rel_type = @intToEnum(macho.reloc_type_x86_64, rel.r_type);
-                switch (rel_type) {
-                    .X86_64_RELOC_BRANCH => {
-                        // TODO rewrite relocation
-                        try addStub(target, context);
-                        addend = mem.readIntLittle(i32, self.code.items[offset..][0..4]);
-                    },
-                    .X86_64_RELOC_GOT, .X86_64_RELOC_GOT_LOAD => {
-                        // TODO rewrite relocation
-                        try addGotEntry(target, context);
-                        addend = mem.readIntLittle(i32, self.code.items[offset..][0..4]);
-                    },
-                    .X86_64_RELOC_UNSIGNED => {
-                        addend = if (rel.r_length == 3)
-                            mem.readIntLittle(i64, self.code.items[offset..][0..8])
-                        else
-                            mem.readIntLittle(i32, self.code.items[offset..][0..4]);
-                        if (rel.r_extern == 0) {
-                            const seg = context.object.load_commands.items[context.object.segment_cmd_index.?].segment;
-                            const target_sect_base_addr = seg.sections.items[rel.r_symbolnum - 1].addr;
-                            addend -= @intCast(i64, target_sect_base_addr);
-                        }
-                        try self.addPtrBindingOrRebase(rel, target, context);
-                    },
-                    .X86_64_RELOC_SIGNED,
-                    .X86_64_RELOC_SIGNED_1,
-                    .X86_64_RELOC_SIGNED_2,
-                    .X86_64_RELOC_SIGNED_4,
-                    => {
-                        const correction: u3 = switch (rel_type) {
-                            .X86_64_RELOC_SIGNED => 0,
-                            .X86_64_RELOC_SIGNED_1 => 1,
-                            .X86_64_RELOC_SIGNED_2 => 2,
-                            .X86_64_RELOC_SIGNED_4 => 4,
-                            else => unreachable,
-                        };
-                        addend = mem.readIntLittle(i32, self.code.items[offset..][0..4]) + correction;
-                        if (rel.r_extern == 0) {
-                            // Note for the future self: when r_extern == 0, we should subtract correction from the
-                            // addend.
-                            const seg = context.object.load_commands.items[context.object.segment_cmd_index.?].segment;
-                            const target_sect_base_addr = seg.sections.items[rel.r_symbolnum - 1].addr;
-                            addend += @intCast(i64, context.base_addr + offset + 4) -
-                                @intCast(i64, target_sect_base_addr);
-                        }
-                    },
-                    .X86_64_RELOC_TLV => {
-                        if (target == .global) {
-                            try addTlvPtrEntry(target, context);
-                        }
-                    },
-                    else => {},
-                }
-            },
-            else => unreachable,
-        }
+    //         const n_strx = context.macho_file.strtab_dir.getKeyAdapted(
+    //             @as([]const u8, sym_name),
+    //             StringIndexAdapter{
+    //                 .bytes = &context.macho_file.strtab,
+    //             },
+    //         ) orelse unreachable;
+    //         break :target Relocation.Target{ .global = n_strx };
+    //     };
+    //     const offset = @intCast(u32, rel.r_address - context.base_offset);
 
-        try self.relocs.append(context.allocator, .{
-            .offset = offset,
-            .target = target,
-            .addend = addend,
-            .subtractor = subtractor,
-            .pcrel = rel.r_pcrel == 1,
-            .length = rel.r_length,
-            .@"type" = rel.r_type,
-        });
+    //     switch (arch) {
+    //         .aarch64 => {
+    //             switch (@intToEnum(macho.reloc_type_arm64, rel.r_type)) {
+    //                 .ARM64_RELOC_BRANCH26 => {
+    //                     // TODO rewrite relocation
+    //                     try addStub(target, context);
+    //                 },
+    //                 .ARM64_RELOC_GOT_LOAD_PAGE21,
+    //                 .ARM64_RELOC_GOT_LOAD_PAGEOFF12,
+    //                 .ARM64_RELOC_POINTER_TO_GOT,
+    //                 => {
+    //                     // TODO rewrite relocation
+    //                     try addGotEntry(target, context);
+    //                 },
+    //                 .ARM64_RELOC_UNSIGNED => {
+    //                     addend = if (rel.r_length == 3)
+    //                         mem.readIntLittle(i64, self.code.items[offset..][0..8])
+    //                     else
+    //                         mem.readIntLittle(i32, self.code.items[offset..][0..4]);
+    //                     if (rel.r_extern == 0) {
+    //                         const seg = context.object.load_commands.items[context.object.segment_cmd_index.?].segment;
+    //                         const target_sect_base_addr = seg.sections.items[rel.r_symbolnum - 1].addr;
+    //                         addend -= @intCast(i64, target_sect_base_addr);
+    //                     }
+    //                     try self.addPtrBindingOrRebase(rel, target, context);
+    //                 },
+    //                 .ARM64_RELOC_TLVP_LOAD_PAGE21,
+    //                 .ARM64_RELOC_TLVP_LOAD_PAGEOFF12,
+    //                 => {
+    //                     if (target == .global) {
+    //                         try addTlvPtrEntry(target, context);
+    //                     }
+    //                 },
+    //                 else => {},
+    //             }
+    //         },
+    //         .x86_64 => {
+    //             const rel_type = @intToEnum(macho.reloc_type_x86_64, rel.r_type);
+    //             switch (rel_type) {
+    //                 .X86_64_RELOC_BRANCH => {
+    //                     // TODO rewrite relocation
+    //                     try addStub(target, context);
+    //                     addend = mem.readIntLittle(i32, self.code.items[offset..][0..4]);
+    //                 },
+    //                 .X86_64_RELOC_GOT, .X86_64_RELOC_GOT_LOAD => {
+    //                     // TODO rewrite relocation
+    //                     try addGotEntry(target, context);
+    //                     addend = mem.readIntLittle(i32, self.code.items[offset..][0..4]);
+    //                 },
+    //                 .X86_64_RELOC_UNSIGNED => {
+    //                     addend = if (rel.r_length == 3)
+    //                         mem.readIntLittle(i64, self.code.items[offset..][0..8])
+    //                     else
+    //                         mem.readIntLittle(i32, self.code.items[offset..][0..4]);
+    //                     if (rel.r_extern == 0) {
+    //                         const seg = context.object.load_commands.items[context.object.segment_cmd_index.?].segment;
+    //                         const target_sect_base_addr = seg.sections.items[rel.r_symbolnum - 1].addr;
+    //                         addend -= @intCast(i64, target_sect_base_addr);
+    //                     }
+    //                     try self.addPtrBindingOrRebase(rel, target, context);
+    //                 },
+    //                 .X86_64_RELOC_SIGNED,
+    //                 .X86_64_RELOC_SIGNED_1,
+    //                 .X86_64_RELOC_SIGNED_2,
+    //                 .X86_64_RELOC_SIGNED_4,
+    //                 => {
+    //                     const correction: u3 = switch (rel_type) {
+    //                         .X86_64_RELOC_SIGNED => 0,
+    //                         .X86_64_RELOC_SIGNED_1 => 1,
+    //                         .X86_64_RELOC_SIGNED_2 => 2,
+    //                         .X86_64_RELOC_SIGNED_4 => 4,
+    //                         else => unreachable,
+    //                     };
+    //                     addend = mem.readIntLittle(i32, self.code.items[offset..][0..4]) + correction;
+    //                     if (rel.r_extern == 0) {
+    //                         // Note for the future self: when r_extern == 0, we should subtract correction from the
+    //                         // addend.
+    //                         const seg = context.object.load_commands.items[context.object.segment_cmd_index.?].segment;
+    //                         const target_sect_base_addr = seg.sections.items[rel.r_symbolnum - 1].addr;
+    //                         addend += @intCast(i64, context.base_addr + offset + 4) -
+    //                             @intCast(i64, target_sect_base_addr);
+    //                     }
+    //                 },
+    //                 .X86_64_RELOC_TLV => {
+    //                     if (target == .global) {
+    //                         try addTlvPtrEntry(target, context);
+    //                     }
+    //                 },
+    //                 else => {},
+    //             }
+    //         },
+    //         else => unreachable,
+    //     }
 
-        addend = 0;
-        subtractor = null;
-    }
+    //     try self.relocs.append(context.allocator, .{
+    //         .offset = offset,
+    //         .target = target,
+    //         .addend = addend,
+    //         .subtractor = subtractor,
+    //         .pcrel = rel.r_pcrel == 1,
+    //         .length = rel.r_length,
+    //         .@"type" = rel.r_type,
+    //     });
+
+    //     addend = 0;
+    //     subtractor = null;
+    // }
 }
 
 fn addPtrBindingOrRebase(
