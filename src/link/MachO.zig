@@ -1034,26 +1034,23 @@ pub fn flushModule(self: *MachO, comp: *Compilation, prog_node: *std.Progress.No
                 try object.splitIntoAtomsWhole(self, @intCast(u32, object_id));
             }
 
-            self.logAtoms();
-            // try self.gcAtoms();
-            // try self.pruneAndSortSections();
-            // try self.allocateSegments();
-            // try self.allocateLocals();
+            try self.gcAtoms();
+            try self.pruneAndSortSections();
+            try self.allocateSegments();
+            try self.allocateSymbols();
         } else {
             // TODO incremental mode: parsing objects into atoms
-            // try self.parseObjectsIntoAtoms();
         }
-
-        self.logSymtab();
-        return error.TODO;
 
         // try self.allocateSpecialSymbols();
 
-        // if (build_options.enable_logging or true) {
-        //     self.logSymtab();
-        //     self.logSectionOrdinals();
-        //     self.logAtoms();
-        // }
+        if (build_options.enable_logging or true) {
+            self.logSymtab();
+            self.logSectionOrdinals();
+            self.logAtoms();
+        }
+
+        return error.TODO;
 
         // if (use_llvm or use_stage1) {
         //     try self.writeAllAtoms();
@@ -2065,7 +2062,7 @@ pub fn writeAtom(self: *MachO, atom: *Atom, match: MatchingSection) !void {
     try self.base.file.?.pwriteAll(atom.code.items, file_offset);
 }
 
-fn allocateLocals(self: *MachO) !void {
+fn allocateSymbols(self: *MachO) !void {
     var it = self.atoms.iterator();
     while (it.next()) |entry| {
         const match = entry.key_ptr.*;
@@ -2086,19 +2083,15 @@ fn allocateLocals(self: *MachO) !void {
             const alignment = try math.powi(u32, 2, atom.alignment);
             base_vaddr = mem.alignForwardGeneric(u64, base_vaddr, alignment);
 
-            const sym = &self.locals.items[atom.sym_index];
+            const sym = atom.getSymbolPtr(self);
             sym.n_value = base_vaddr;
             sym.n_sect = n_sect;
 
-            log.debug("  {d}: {s} allocated at 0x{x}", .{
-                atom.sym_index,
-                self.getString(sym.n_strx),
-                base_vaddr,
-            });
+            log.debug("  %{d}: {s} allocated at 0x{x}", .{ atom.sym_index, atom.getName(self), base_vaddr });
 
             // Update each symbol contained within the atom
             for (atom.contained.items) |sym_at_off| {
-                const contained_sym = &self.locals.items[sym_at_off.sym_index];
+                const contained_sym = self.getSymbolPtr(.{ .sym_index = sym_at_off.sym_index, .file = atom.file });
                 contained_sym.n_value = base_vaddr + sym_at_off.offset;
                 contained_sym.n_sect = n_sect;
             }
@@ -5269,35 +5262,21 @@ fn pruneAndSortSections(self: *MachO) !void {
 }
 
 fn gcAtoms(self: *MachO) !void {
-    const dead_strip = self.base.options.gc_sections orelse false;
+    const dead_strip = self.base.options.gc_sections orelse return;
     if (!dead_strip) return;
 
+    const gpa = self.base.allocator;
+
     // Add all exports as GC roots
-    for (self.globals.items) |sym| {
-        if (sym.n_type == 0) continue;
-        const resolv = self.symbol_resolver.get(sym.n_strx).?;
-        assert(resolv.where == .global);
-        const gc_root = self.atom_by_index_table.get(resolv.sym_index) orelse {
-            log.warn("skipping {s}", .{self.getString(sym.n_strx)});
+    for (self.globals.values()) |global| {
+        const sym = self.getSymbol(global);
+        if (!sym.sect()) continue;
+        const gc_root = self.getAtomForSymbol(global) orelse {
+            log.warn("skipping {s}", .{self.getSymbolName(global)});
             continue;
         };
-        _ = try self.gc_roots.getOrPut(self.base.allocator, gc_root);
+        _ = try self.gc_roots.getOrPut(gpa, gc_root);
     }
-
-    // if (self.tlv_ptrs_section_index) |sect| {
-    //     var atom = self.atoms.get(.{
-    //         .seg = self.data_segment_cmd_index.?,
-    //         .sect = sect,
-    //     }).?;
-
-    //     while (true) {
-    //         _ = try self.gc_roots.getOrPut(self.base.allocator, atom);
-
-    //         if (atom.prev) |prev| {
-    //             atom = prev;
-    //         } else break;
-    //     }
-    // }
 
     // Add any atom targeting an import as GC root
     var atoms_it = self.atoms.iterator();
@@ -5306,19 +5285,13 @@ fn gcAtoms(self: *MachO) !void {
 
         while (true) {
             for (atom.relocs.items) |rel| {
-                if ((try Atom.getTargetAtom(rel, self)) == null) switch (rel.target) {
-                    .local => {},
-                    .global => |n_strx| {
-                        const resolv = self.symbol_resolver.get(n_strx).?;
-                        switch (resolv.where) {
-                            .global => {},
-                            .undef => {
-                                _ = try self.gc_roots.getOrPut(self.base.allocator, atom);
-                                break;
-                            },
-                        }
-                    },
-                };
+                if ((try rel.getTargetAtom(self)) == null) {
+                    const target_sym = self.getSymbol(rel.target);
+                    if (target_sym.undf()) {
+                        _ = try self.gc_roots.getOrPut(gpa, atom);
+                        break;
+                    }
+                }
             }
 
             if (atom.prev) |prev| {
@@ -5327,11 +5300,11 @@ fn gcAtoms(self: *MachO) !void {
         }
     }
 
-    var stack = std.ArrayList(*Atom).init(self.base.allocator);
+    var stack = std.ArrayList(*Atom).init(gpa);
     defer stack.deinit();
     try stack.ensureUnusedCapacity(self.gc_roots.count());
 
-    var retained = std.AutoHashMap(*Atom, void).init(self.base.allocator);
+    var retained = std.AutoHashMap(*Atom, void).init(gpa);
     defer retained.deinit();
     try retained.ensureUnusedCapacity(self.gc_roots.count());
 
@@ -5347,7 +5320,7 @@ fn gcAtoms(self: *MachO) !void {
     log.warn("walking tree...", .{});
     while (stack.popOrNull()) |source_atom| {
         for (source_atom.relocs.items) |rel| {
-            if (try Atom.getTargetAtom(rel, self)) |target_atom| {
+            if (try rel.getTargetAtom(self)) |target_atom| {
                 const gop = try retained.getOrPut(target_atom);
                 if (!gop.found_existing) {
                     log.warn("  RETAINED ATOM(%{d}) -> ATOM(%{d})", .{
@@ -5393,45 +5366,24 @@ fn gcAtoms(self: *MachO) !void {
                 // Dead atom; remove.
                 log.warn("  DEAD ATOM(%{d})", .{atom.sym_index});
 
-                const sym = &self.locals.items[atom.sym_index];
+                const sym = atom.getSymbolPtr(self);
                 sym.n_desc = N_DESC_GCED;
 
-                if (self.symbol_resolver.getPtr(sym.n_strx)) |resolv| {
-                    if (resolv.sym_index == atom.sym_index) {
-                        const global = &self.globals.items[resolv.where_index];
-                        global.n_desc = N_DESC_GCED;
-                    }
-                }
-
-                for (self.got_entries.items) |got_entry| {
-                    if (got_entry.atom == atom) {
-                        _ = self.got_entries_table.swapRemove(got_entry.target);
-                        break;
-                    }
-                }
-
-                for (self.stubs.items) |stub, i| {
-                    if (stub == atom) {
-                        _ = self.stubs_table.swapRemove(@intCast(u32, i));
-                        break;
-                    }
-                }
+                // TODO add full bookkeeping here
+                const global = SymbolWithLoc{ .sym_index = atom.sym_index, .file = atom.file };
+                _ = self.got_entries_table.swapRemove(global);
+                _ = self.stubs_table.swapRemove(global);
+                _ = self.tlv_ptr_entries_table.swapRemove(global);
 
                 for (atom.contained.items) |sym_off| {
-                    const inner = &self.locals.items[sym_off.sym_index];
+                    const inner = self.getSymbolPtr(.{ .sym_index = sym_off.sym_index, .file = atom.file });
                     inner.n_desc = N_DESC_GCED;
-
-                    if (self.symbol_resolver.getPtr(inner.n_strx)) |resolv| {
-                        if (resolv.sym_index == atom.sym_index) {
-                            const global = &self.globals.items[resolv.where_index];
-                            global.n_desc = N_DESC_GCED;
-                        }
-                    }
                 }
 
                 log.warn("  BEFORE size = {x}", .{sect.size});
                 sect.size -= atom.size;
                 log.warn("  AFTER size = {x}", .{sect.size});
+
                 if (atom.prev) |prev| {
                     prev.next = atom.next;
                 }
@@ -6724,7 +6676,12 @@ fn logSymtab(self: *MachO) void {
         if (target_sym.undf()) {
             log.warn("  {d}@{x} => import('{s}')", .{ value, atom_sym.n_value, self.getSymbolName(target) });
         } else {
-            log.warn("  {d}@{x} => local(%{d})", .{ value, atom_sym.n_value, target.sym_index });
+            log.warn("  {d}@{x} => local(%{d}) in object({d})", .{
+                value,
+                atom_sym.n_value,
+                target.sym_index,
+                target.file,
+            });
         }
     }
 
@@ -6753,7 +6710,7 @@ fn logSectionOrdinals(self: MachO) void {
     for (self.section_ordinals.keys()) |match, i| {
         const seg = self.load_commands.items[match.seg].segment;
         const sect = seg.sections.items[match.sect];
-        log.debug("ord {d}: {d},{d} => {s},{s}", .{
+        log.debug("sectord({d}): {d},{d} => {s},{s}", .{
             i + 1,
             match.seg,
             match.sect,
