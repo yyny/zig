@@ -165,15 +165,15 @@ strtab: StringTable(.link) = .{},
 
 tlv_ptr_entries: std.ArrayListUnmanaged(Entry) = .{},
 tlv_ptr_entries_free_list: std.ArrayListUnmanaged(u32) = .{},
-tlv_ptr_entries_table: std.AutoArrayHashMapUnmanaged(Atom.Relocation.Target, u32) = .{},
+tlv_ptr_entries_table: std.AutoArrayHashMapUnmanaged(SymbolWithLoc, u32) = .{},
 
 got_entries: std.ArrayListUnmanaged(Entry) = .{},
 got_entries_free_list: std.ArrayListUnmanaged(u32) = .{},
-got_entries_table: std.AutoArrayHashMapUnmanaged(Atom.Relocation.Target, u32) = .{},
+got_entries_table: std.AutoArrayHashMapUnmanaged(SymbolWithLoc, u32) = .{},
 
-stubs: std.ArrayListUnmanaged(*Atom) = .{},
+stubs: std.ArrayListUnmanaged(Entry) = .{},
 stubs_free_list: std.ArrayListUnmanaged(u32) = .{},
-stubs_table: std.AutoArrayHashMapUnmanaged(u32, u32) = .{},
+stubs_table: std.AutoArrayHashMapUnmanaged(SymbolWithLoc, u32) = .{},
 
 error_flags: File.ErrorFlags = File.ErrorFlags{},
 
@@ -240,7 +240,7 @@ decls: std.AutoArrayHashMapUnmanaged(Module.Decl.Index, ?MatchingSection) = .{},
 gc_roots: std.AutoHashMapUnmanaged(*Atom, void) = .{},
 
 const Entry = struct {
-    target: Atom.Relocation.Target,
+    target: SymbolWithLoc,
     atom: *Atom,
 };
 
@@ -2255,7 +2255,7 @@ fn writeAtoms(self: *MachO) !void {
     }
 }
 
-pub fn createGotAtom(self: *MachO, target: Atom.Relocation.Target) !*Atom {
+pub fn createGotAtom(self: *MachO, target: SymbolWithLoc) !*Atom {
     const gpa = self.base.allocator;
     const sym_index = @intCast(u32, self.locals.items.len);
     try self.locals.append(gpa, .{
@@ -2265,6 +2265,7 @@ pub fn createGotAtom(self: *MachO, target: Atom.Relocation.Target) !*Atom {
         .n_desc = 0,
         .n_value = 0,
     });
+
     const atom = try MachO.createEmptyAtom(gpa, sym_index, @sizeOf(u64), 3);
     try atom.relocs.append(gpa, .{
         .offset = 0,
@@ -2279,23 +2280,25 @@ pub fn createGotAtom(self: *MachO, target: Atom.Relocation.Target) !*Atom {
             else => unreachable,
         },
     });
-    switch (target) {
-        .local => {
-            try atom.rebases.append(gpa, 0);
-        },
-        .global => |n_strx| {
-            try atom.bindings.append(gpa, .{
-                .n_strx = n_strx,
-                .offset = 0,
-            });
-        },
+
+    const target_sym = self.getSymbol(target);
+    if (target_sym.undf()) {
+        const global_index = @intCast(u32, self.globals.getIndex(self.getSymbolName(target)).?);
+        try atom.bindings.append(gpa, .{
+            .global_index = global_index,
+            .offset = 0,
+        });
+    } else {
+        try atom.rebases.append(gpa, 0);
     }
+
     try self.managed_atoms.append(gpa, atom);
     try self.atom_by_index_table.putNoClobber(gpa, sym_index, atom);
+
     return atom;
 }
 
-pub fn createTlvPtrAtom(self: *MachO, target: Atom.Relocation.Target) !*Atom {
+pub fn createTlvPtrAtom(self: *MachO, target: SymbolWithLoc) !*Atom {
     const gpa = self.base.allocator;
     const sym_index = @intCast(u32, self.locals.items.len);
     try self.locals.append(gpa, .{
@@ -2305,14 +2308,19 @@ pub fn createTlvPtrAtom(self: *MachO, target: Atom.Relocation.Target) !*Atom {
         .n_desc = 0,
         .n_value = 0,
     });
+
     const atom = try MachO.createEmptyAtom(gpa, sym_index, @sizeOf(u64), 3);
-    assert(target == .global);
+    const target_sym = self.getSymbol(target);
+    assert(target_sym.undf());
+    const global_index = @intCast(u32, self.globals.getIndex(self.getSymbolName(target)).?);
     try atom.bindings.append(gpa, .{
-        .n_strx = target.global,
+        .global_index = global_index,
         .offset = 0,
     });
+
     try self.managed_atoms.append(gpa, atom);
     try self.atom_by_index_table.putNoClobber(gpa, sym_index, atom);
+
     return atom;
 }
 
@@ -2384,7 +2392,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             atom.code.items[2] = 0x1d;
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 3,
-                .target = .{ .local = dyld_private_sym_index },
+                .target = .{ .sym_index = dyld_private_sym_index, .file = null },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = true,
@@ -2399,7 +2407,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             atom.code.items[10] = 0x25;
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 11,
-                .target = .{ .global = self.locals.items[self.dyld_stub_binder_index.?].n_strx },
+                .target = .{ .sym_index = self.dyld_stub_binder_index.?, .file = null },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = true,
@@ -2413,7 +2421,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             mem.writeIntLittle(u32, atom.code.items[0..][0..4], aarch64.Instruction.adrp(.x17, 0).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 0,
-                .target = .{ .local = dyld_private_sym_index },
+                .target = .{ .sym_index = dyld_private_sym_index, .file = null },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = true,
@@ -2424,7 +2432,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             mem.writeIntLittle(u32, atom.code.items[4..][0..4], aarch64.Instruction.add(.x17, .x17, 0, false).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 4,
-                .target = .{ .local = dyld_private_sym_index },
+                .target = .{ .sym_index = dyld_private_sym_index, .file = null },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = false,
@@ -2442,7 +2450,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             mem.writeIntLittle(u32, atom.code.items[12..][0..4], aarch64.Instruction.adrp(.x16, 0).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 12,
-                .target = .{ .global = self.locals.items[self.dyld_stub_binder_index.?].n_strx },
+                .target = .{ .sym_index = self.dyld_stub_binder_index.?, .file = null },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = true,
@@ -2457,7 +2465,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             ).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 16,
-                .target = .{ .global = self.locals.items[self.dyld_stub_binder_index.?].n_strx },
+                .target = .{ .sym_index = self.dyld_stub_binder_index.?, .file = null },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = false,
@@ -2521,7 +2529,7 @@ pub fn createStubHelperAtom(self: *MachO) !*Atom {
             atom.code.items[5] = 0xe9;
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 6,
-                .target = .{ .local = self.stub_helper_preamble_atom.?.sym_index },
+                .target = .{ .sym_index = self.stub_helper_preamble_atom.?.sym_index, .file = null },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = true,
@@ -2543,7 +2551,7 @@ pub fn createStubHelperAtom(self: *MachO) !*Atom {
             mem.writeIntLittle(u32, atom.code.items[4..8], aarch64.Instruction.b(0).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 4,
-                .target = .{ .local = self.stub_helper_preamble_atom.?.sym_index },
+                .target = .{ .sym_index = self.stub_helper_preamble_atom.?.sym_index, .file = null },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = true,
@@ -2561,9 +2569,10 @@ pub fn createStubHelperAtom(self: *MachO) !*Atom {
     return atom;
 }
 
-pub fn createLazyPointerAtom(self: *MachO, stub_sym_index: u32, n_strx: u32) !*Atom {
+pub fn createLazyPointerAtom(self: *MachO, stub_sym_index: u32, target: SymbolWithLoc) !*Atom {
     const gpa = self.base.allocator;
     const sym_index = @intCast(u32, self.locals.items.len);
+    const global_index = @intCast(u32, self.globals.getIndex(self.getSymbolName(target)).?);
     try self.locals.append(gpa, .{
         .n_strx = 0,
         .n_type = macho.N_SECT,
@@ -2574,7 +2583,7 @@ pub fn createLazyPointerAtom(self: *MachO, stub_sym_index: u32, n_strx: u32) !*A
     const atom = try MachO.createEmptyAtom(gpa, sym_index, @sizeOf(u64), 3);
     try atom.relocs.append(gpa, .{
         .offset = 0,
-        .target = .{ .local = stub_sym_index },
+        .target = .{ .sym_index = stub_sym_index, .file = null },
         .addend = 0,
         .subtractor = null,
         .pcrel = false,
@@ -2587,7 +2596,7 @@ pub fn createLazyPointerAtom(self: *MachO, stub_sym_index: u32, n_strx: u32) !*A
     });
     try atom.rebases.append(gpa, 0);
     try atom.lazy_bindings.append(gpa, .{
-        .n_strx = n_strx,
+        .global_index = global_index,
         .offset = 0,
     });
 
@@ -2626,7 +2635,7 @@ pub fn createStubAtom(self: *MachO, laptr_sym_index: u32) !*Atom {
             atom.code.items[1] = 0x25;
             try atom.relocs.append(gpa, .{
                 .offset = 2,
-                .target = .{ .local = laptr_sym_index },
+                .target = .{ .sym_index = laptr_sym_index, .file = null },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = true,
@@ -2640,7 +2649,7 @@ pub fn createStubAtom(self: *MachO, laptr_sym_index: u32) !*Atom {
             mem.writeIntLittle(u32, atom.code.items[0..4], aarch64.Instruction.adrp(.x16, 0).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 0,
-                .target = .{ .local = laptr_sym_index },
+                .target = .{ .sym_index = laptr_sym_index, .file = null },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = true,
@@ -2655,7 +2664,7 @@ pub fn createStubAtom(self: *MachO, laptr_sym_index: u32) !*Atom {
             ).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 4,
-                .target = .{ .local = laptr_sym_index },
+                .target = .{ .sym_index = laptr_sym_index, .file = null },
                 .addend = 0,
                 .subtractor = null,
                 .pcrel = false,
@@ -2751,6 +2760,7 @@ fn createDsoHandleSymbol(self: *MachO) !void {
         .n_desc = macho.N_WEAK_DEF,
         .n_value = 0,
     };
+    _ = self.unresolved.swapRemove(@intCast(u32, self.globals.getIndex("___dso_handle").?));
 }
 
 fn resolveSymbolsInObject(self: *MachO, object: *Object, object_id: u16) !void {
@@ -2983,10 +2993,8 @@ fn resolveDyldStubBinder(self: *MachO) !void {
         .n_value = 0,
     });
     const sym_name = try gpa.dupe(u8, "dyld_stub_binder");
-    try self.globals.putNoClobber(gpa, sym_name, .{
-        .sym_index = sym_index,
-        .file = null,
-    });
+    const global = SymbolWithLoc{ .sym_index = sym_index, .file = null };
+    try self.globals.putNoClobber(gpa, sym_name, global);
     const sym = &self.locals.items[sym_index];
 
     for (self.dylibs.items) |dylib, id| {
@@ -3012,11 +3020,10 @@ fn resolveDyldStubBinder(self: *MachO) !void {
     }
 
     // Add dyld_stub_binder as the final GOT entry.
-    const target = Atom.Relocation.Target{ .global = n_strx };
-    const atom = try self.createGotAtom(target);
-    const got_index = @intCast(u32, self.got_entries.items.len);
-    try self.got_entries.append(self.base.allocator, .{ .target = target, .atom = atom });
-    try self.got_entries_table.putNoClobber(self.base.allocator, target, got_index);
+    const got_index = try self.allocateGotEntry(global);
+    const atom = try self.createGotAtom(global);
+    self.got_entries.items[got_index].atom = atom;
+
     const match = MatchingSection{
         .seg = self.data_const_segment_cmd_index.?,
         .sect = self.got_section_index.?,
@@ -3217,7 +3224,7 @@ fn freeAtom(self: *MachO, atom: *Atom, match: MatchingSection, owns_atom: bool) 
     if (atom.prev) |prev| {
         prev.next = atom.next;
 
-        if (!already_have_free_list_node and prev.freeListEligible(self.*)) {
+        if (!already_have_free_list_node and prev.freeListEligible(self)) {
             // The free list is heuristics, it doesn't have to be perfect, so we can ignore
             // the OOM here.
             free_list.append(self.base.allocator, prev) catch {};
@@ -3249,7 +3256,7 @@ fn shrinkAtom(self: *MachO, atom: *Atom, new_block_size: u64, match: MatchingSec
 fn growAtom(self: *MachO, atom: *Atom, new_atom_size: u64, alignment: u64, match: MatchingSection) !u64 {
     const sym = self.locals.items[atom.sym_index];
     const align_ok = mem.alignBackwardGeneric(u64, sym.n_value, alignment) == sym.n_value;
-    const need_realloc = !align_ok or new_atom_size > atom.capacity(self.*);
+    const need_realloc = !align_ok or new_atom_size > atom.capacity(self);
     if (!need_realloc) return sym.n_value;
     return self.allocateAtom(atom, new_atom_size, alignment, match);
 }
@@ -3280,7 +3287,7 @@ fn allocateLocalSymbol(self: *MachO) !u32 {
     return index;
 }
 
-pub fn allocateGotEntry(self: *MachO, target: Atom.Relocation.Target) !u32 {
+pub fn allocateGotEntry(self: *MachO, target: SymbolWithLoc) !u32 {
     try self.got_entries.ensureUnusedCapacity(self.base.allocator, 1);
 
     const index = blk: {
@@ -3295,16 +3302,13 @@ pub fn allocateGotEntry(self: *MachO, target: Atom.Relocation.Target) !u32 {
         }
     };
 
-    self.got_entries.items[index] = .{
-        .target = target,
-        .atom = undefined,
-    };
+    self.got_entries.items[index] = .{ .target = target, .atom = undefined };
     try self.got_entries_table.putNoClobber(self.base.allocator, target, index);
 
     return index;
 }
 
-pub fn allocateStubEntry(self: *MachO, n_strx: u32) !u32 {
+pub fn allocateStubEntry(self: *MachO, target: SymbolWithLoc) !u32 {
     try self.stubs.ensureUnusedCapacity(self.base.allocator, 1);
 
     const index = blk: {
@@ -3319,13 +3323,13 @@ pub fn allocateStubEntry(self: *MachO, n_strx: u32) !u32 {
         }
     };
 
-    self.stubs.items[index] = undefined;
-    try self.stubs_table.putNoClobber(self.base.allocator, n_strx, index);
+    self.stubs.items[index] = .{ .target = target, .atom = undefined };
+    try self.stubs_table.putNoClobber(self.base.allocator, target, index);
 
     return index;
 }
 
-pub fn allocateTlvPtrEntry(self: *MachO, target: Atom.Relocation.Target) !u32 {
+pub fn allocateTlvPtrEntry(self: *MachO, target: SymbolWithLoc) !u32 {
     try self.tlv_ptr_entries.ensureUnusedCapacity(self.base.allocator, 1);
 
     const index = blk: {
@@ -3355,7 +3359,7 @@ pub fn allocateDeclIndexes(self: *MachO, decl_index: Module.Decl.Index) !void {
     try self.atom_by_index_table.putNoClobber(self.base.allocator, decl.link.macho.sym_index, &decl.link.macho);
     try self.decls.putNoClobber(self.base.allocator, decl_index, null);
 
-    const got_target = .{ .local = decl.link.macho.sym_index };
+    const got_target = .{ .sym_index = decl.link.macho.sym_index, .file = null };
     const got_index = try self.allocateGotEntry(got_target);
     const got_atom = try self.createGotAtom(got_target);
     self.got_entries.items[got_index].atom = got_atom;
@@ -3767,7 +3771,7 @@ fn placeDecl(self: *MachO, decl_index: Module.Decl.Index, code_len: usize) !*mac
     const match = decl_ptr.*.?;
 
     if (decl.link.macho.size != 0) {
-        const capacity = decl.link.macho.capacity(self.*);
+        const capacity = decl.link.macho.capacity(self);
         const need_realloc = code_len > capacity or !mem.isAlignedGeneric(u64, symbol.n_value, required_alignment);
 
         if (need_realloc) {
@@ -3801,7 +3805,7 @@ fn placeDecl(self: *MachO, decl_index: Module.Decl.Index, code_len: usize) !*mac
             .n_desc = 0,
             .n_value = addr,
         };
-        const got_index = self.got_entries_table.get(.{ .local = decl.link.macho.sym_index }).?;
+        const got_index = self.got_entries_table.get(.{ .sym_index = decl.link.macho.sym_index, .file = null }).?;
         const got_atom = self.got_entries.items[got_index].atom;
         const got_sym = &self.locals.items[got_atom.sym_index];
         const vaddr = try self.allocateAtom(got_atom, @sizeOf(u64), 8, .{
@@ -4015,10 +4019,11 @@ pub fn freeDecl(self: *MachO, decl_index: Module.Decl.Index) void {
         self.locals_free_list.append(self.base.allocator, decl.link.macho.sym_index) catch {};
 
         // Try freeing GOT atom if this decl had one
-        if (self.got_entries_table.get(.{ .local = decl.link.macho.sym_index })) |got_index| {
+        const got_target = SymbolWithLoc{ .sym_index = decl.link.macho.sym_index, .file = null };
+        if (self.got_entries_table.get(got_target)) |got_index| {
             self.got_entries_free_list.append(self.base.allocator, @intCast(u32, got_index)) catch {};
-            self.got_entries.items[got_index] = .{ .target = .{ .local = 0 }, .atom = undefined };
-            _ = self.got_entries_table.swapRemove(.{ .local = decl.link.macho.sym_index });
+            self.got_entries.items[got_index] = .{ .target = .{ .sym_index = 0, .file = null }, .atom = undefined };
+            _ = self.got_entries_table.swapRemove(got_target);
 
             if (self.d_sym) |*d_sym| {
                 d_sym.swapRemoveRelocs(decl.link.macho.sym_index);
@@ -4050,7 +4055,7 @@ pub fn getDeclVAddr(self: *MachO, decl_index: Module.Decl.Index, reloc_info: Fil
     const atom = self.atom_by_index_table.get(reloc_info.parent_atom_index).?;
     try atom.relocs.append(self.base.allocator, .{
         .offset = @intCast(u32, reloc_info.offset),
-        .target = .{ .local = decl.link.macho.sym_index },
+        .target = .{ .sym_index = decl.link.macho.sym_index, .file = null },
         .addend = reloc_info.addend,
         .subtractor = null,
         .pcrel = false,
@@ -4976,7 +4981,7 @@ fn getSectionMaxAlignment(self: *MachO, segment_id: u16, start_sect_id: u16) !u3
     return max_alignment;
 }
 
-fn allocateAtom(self: *MachO, atom: *Atom, new_atom_size: u64, alignment: u64, match: MatchingSection) !u64 {
+pub fn allocateAtom(self: *MachO, atom: *Atom, new_atom_size: u64, alignment: u64, match: MatchingSection) !u64 {
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -5003,7 +5008,7 @@ fn allocateAtom(self: *MachO, atom: *Atom, new_atom_size: u64, alignment: u64, m
             // We now have a pointer to a live atom that has too much capacity.
             // Is it enough that we could fit this new atom?
             const sym = self.locals.items[big_atom.sym_index];
-            const capacity = big_atom.capacity(self.*);
+            const capacity = big_atom.capacity(self);
             const ideal_capacity = if (needs_padding) padToIdeal(capacity) else capacity;
             const ideal_capacity_end_vaddr = math.add(u64, sym.n_value, ideal_capacity) catch ideal_capacity;
             const capacity_end_vaddr = sym.n_value + capacity;
@@ -5013,7 +5018,7 @@ fn allocateAtom(self: *MachO, atom: *Atom, new_atom_size: u64, alignment: u64, m
                 // Additional bookkeeping here to notice if this free list node
                 // should be deleted because the atom that it points to has grown to take up
                 // more of the extra capacity.
-                if (!big_atom.freeListEligible(self.*)) {
+                if (!big_atom.freeListEligible(self)) {
                     _ = free_list.swapRemove(i);
                 } else {
                     i += 1;
@@ -6664,7 +6669,7 @@ fn logSymAttributes(sym: macho.nlist_64, buf: *[4]u8) []const u8 {
     return buf[0..];
 }
 
-fn logSymtab(self: MachO) void {
+fn logSymtab(self: *MachO) void {
     var buf: [4]u8 = undefined;
 
     log.warn("symtab:", .{});
@@ -6709,33 +6714,39 @@ fn logSymtab(self: MachO) void {
         log.warn("  {s} => %{d} in object({d})", .{ name, value.sym_index, value.file });
     }
 
-    // log.warn("GOT entries:", .{});
-    // for (self.got_entries_table.values()) |value| {
-    //     const key = self.got_entries.items[value].target;
-    //     const atom = self.got_entries.items[value].atom;
-    //     const n_value = self.locals.items[atom.sym_index].n_value;
-    //     switch (key) {
-    //         .local => |ndx| log.warn("  {d}: @{x}", .{ ndx, n_value }),
-    //         .global => |n_strx| log.warn("  {s}: @{x}", .{ self.getString(n_strx), n_value }),
-    //     }
-    // }
+    log.warn("GOT entries:", .{});
+    for (self.got_entries_table.values()) |value| {
+        const target = self.got_entries.items[value].target;
+        const target_sym = self.getSymbol(target);
+        const atom = self.got_entries.items[value].atom;
+        const atom_sym = atom.getSymbol(self);
 
-    // log.warn("__thread_ptrs entries:", .{});
-    // for (self.tlv_ptr_entries_table.values()) |value| {
-    //     const key = self.tlv_ptr_entries.items[value].target;
-    //     const atom = self.tlv_ptr_entries.items[value].atom;
-    //     const n_value = self.locals.items[atom.sym_index].n_value;
-    //     assert(key == .global);
-    //     log.warn("  {s}: @{x}", .{ self.getString(key.global), n_value });
-    // }
+        if (target_sym.undf()) {
+            log.warn("  {d}@{x} => import('{s}')", .{ value, atom_sym.n_value, self.getSymbolName(target) });
+        } else {
+            log.warn("  {d}@{x} => local(%{d})", .{ value, atom_sym.n_value, target.sym_index });
+        }
+    }
 
-    // log.warn("stubs:", .{});
-    // for (self.stubs_table.keys()) |key| {
-    //     const value = self.stubs_table.get(key).?;
-    //     const atom = self.stubs.items[value];
-    //     const sym = self.locals.items[atom.sym_index];
-    //     log.warn("  {s}: @{x}", .{ self.getString(key), sym.n_value });
-    // }
+    log.warn("__thread_ptrs entries:", .{});
+    for (self.tlv_ptr_entries_table.values()) |value| {
+        const target = self.tlv_ptr_entries.items[value].target;
+        const target_sym = self.getSymbol(target);
+        const atom = self.tlv_ptr_entries.items[value].atom;
+        const atom_sym = atom.getSymbol(self);
+        assert(target_sym.undf());
+        log.warn("  {d}@{x} => import('{s}')", .{ value, atom_sym.n_value, self.getSymbolName(target) });
+    }
+
+    log.warn("stubs entries:", .{});
+    for (self.stubs_table.values()) |value| {
+        const target = self.stubs.items[value].target;
+        const target_sym = self.getSymbol(target);
+        const atom = self.stubs.items[value].atom;
+        const atom_sym = atom.getSymbol(self);
+        assert(target_sym.undf());
+        log.warn("  {d}@{x} => import('{s}')", .{ value, atom_sym.n_value, self.getSymbolName(target) });
+    }
 }
 
 fn logSectionOrdinals(self: MachO) void {

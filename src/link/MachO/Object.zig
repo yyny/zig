@@ -579,11 +579,12 @@ fn createAtomFromSubsection(
     sect: macho.section_64,
 ) !*Atom {
     const gpa = macho_file.base.allocator;
-    const sym = self.symtab.items[sym_index];
+    const sym = &self.symtab.items[sym_index];
     const align_pow_2 = try math.powi(u32, 2, alignment);
     const aligned_size = mem.alignForwardGeneric(u64, size, align_pow_2);
     const atom = try MachO.createEmptyAtom(gpa, sym_index, aligned_size, alignment);
     atom.file = object_id;
+    sym.n_sect = @intCast(u8, macho_file.section_ordinals.getIndex(match).? + 1);
 
     try self.atom_by_index_table.putNoClobber(gpa, sym_index, atom);
     try self.managed_atoms.append(gpa, atom);
@@ -594,14 +595,11 @@ fn createAtomFromSubsection(
 
     const base_offset = sym.n_value - sect.addr;
     const filtered_relocs = filterRelocs(relocs, base_offset, base_offset + size);
-    _ = filtered_relocs;
-    // try atom.parseRelocs(filtered_relocs, .{
-    //     .base_addr = sect.addr,
-    //     .base_offset = @intCast(i32, base_offset),
-    //     .allocator = allocator,
-    //     .object = self,
-    //     .macho_file = macho_file,
-    // });
+    try atom.parseRelocs(filtered_relocs, .{
+        .macho_file = macho_file,
+        .base_addr = sect.addr,
+        .base_offset = @intCast(i32, base_offset),
+    });
 
     if (macho_file.has_dices) {
         const dices = filterDice(self.data_in_code_entries, sym.n_value, sym.n_value + size);
