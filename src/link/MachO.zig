@@ -504,7 +504,6 @@ pub fn flushModule(self: *MachO, comp: *Compilation, prog_node: *std.Progress.No
     const is_dyn_lib = self.base.options.link_mode == .Dynamic and is_lib;
     const is_exe_or_dyn_lib = is_dyn_lib or self.base.options.output_mode == .Exe;
     const stack_size = self.base.options.stack_size_override orelse 0;
-    const allow_undef = is_dyn_lib and (self.base.options.allow_shlib_undefined orelse false);
 
     const id_symlink_basename = "zld.id";
     const cache_dir_handle = blk: {
@@ -985,7 +984,7 @@ pub fn flushModule(self: *MachO, comp: *Compilation, prog_node: *std.Progress.No
                 try argv.append(try std.fmt.allocPrint(arena, "-F{s}", .{framework_dir}));
             }
 
-            if (allow_undef) {
+            if (is_dyn_lib and (self.base.options.allow_shlib_undefined orelse false)) {
                 try argv.append("-undefined");
                 try argv.append("dynamic_lookup");
             }
@@ -1020,58 +1019,23 @@ pub fn flushModule(self: *MachO, comp: *Compilation, prog_node: *std.Progress.No
         try self.resolveSymbolsInDylibs();
         try self.createDsoHandleSymbol();
         try self.addCodeSignatureLC();
+        try self.resolveSymbolsAtLoading();
+
+        if (self.unresolved.count() > 0) {
+            return error.UndefinedSymbolReference;
+        }
+        if (lib_not_found) {
+            return error.LibraryNotFound;
+        }
+        if (framework_not_found) {
+            return error.FrameworkNotFound;
+        }
+
+        try self.createTentativeDefAtoms();
+        // try self.parseObjectsIntoAtoms();
+
         self.logSymtab();
         return error.TODO;
-
-        // {
-        //     var next_sym: usize = 0;
-        //     while (next_sym < self.unresolved.count()) {
-        //         const sym = &self.undefs.items[self.unresolved.keys()[next_sym]];
-        //         const sym_name = self.getString(sym.n_strx);
-        //         const resolv = self.symbol_resolver.get(sym.n_strx) orelse unreachable;
-
-        //         if (sym.discarded()) {
-        //             sym.* = .{
-        //                 .n_strx = 0,
-        //                 .n_type = macho.N_UNDF,
-        //                 .n_sect = 0,
-        //                 .n_desc = 0,
-        //                 .n_value = 0,
-        //             };
-        //             _ = self.unresolved.swapRemove(resolv.where_index);
-        //             continue;
-        //         } else if (allow_undef) {
-        //             const n_desc = @bitCast(
-        //                 u16,
-        //                 macho.BIND_SPECIAL_DYLIB_FLAT_LOOKUP * @intCast(i16, macho.N_SYMBOL_RESOLVER),
-        //             );
-        //             // TODO allow_shlib_undefined is an ELF flag so figure out macOS specific flags too.
-        //             sym.n_type = macho.N_EXT;
-        //             sym.n_desc = n_desc;
-        //             _ = self.unresolved.swapRemove(resolv.where_index);
-        //             continue;
-        //         }
-
-        //         log.err("undefined reference to symbol '{s}'", .{sym_name});
-        //         if (resolv.file) |file| {
-        //             log.err("  first referenced in '{s}'", .{self.objects.items[file].name});
-        //         }
-
-        //         next_sym += 1;
-        //     }
-        // }
-        // if (self.unresolved.count() > 0) {
-        //     return error.UndefinedSymbolReference;
-        // }
-        // if (lib_not_found) {
-        //     return error.LibraryNotFound;
-        // }
-        // if (framework_not_found) {
-        //     return error.FrameworkNotFound;
-        // }
-
-        // try self.createTentativeDefAtoms();
-        // try self.parseObjectsIntoAtoms();
 
         // const use_llvm = build_options.have_llvm and self.base.options.use_llvm;
         // if (use_llvm or use_stage1) {
@@ -2684,44 +2648,35 @@ pub fn createStubAtom(self: *MachO, laptr_sym_index: u32) !*Atom {
 }
 
 fn createTentativeDefAtoms(self: *MachO) !void {
-    if (self.tentatives.count() == 0) return;
-    // Convert any tentative definition into a regular symbol and allocate
-    // text blocks for each tentative definition.
-    while (self.tentatives.popOrNull()) |entry| {
+    for (self.globals.values()) |global| {
+        const sym = self.getSymbolPtr(global);
+        if (!sym.tentative()) continue;
+
+        // Convert any tentative definition into a regular symbol and allocate
+        // text blocks for each tentative definition.
         const match = MatchingSection{
             .seg = self.data_segment_cmd_index.?,
             .sect = self.bss_section_index.?,
         };
         _ = try self.section_ordinals.getOrPut(self.base.allocator, match);
 
-        const global_sym = &self.globals.items[entry.key];
-        const size = global_sym.n_value;
-        const alignment = (global_sym.n_desc >> 8) & 0x0f;
+        const size = sym.n_value;
+        const alignment = (sym.n_desc >> 8) & 0x0f;
 
-        global_sym.n_value = 0;
-        global_sym.n_desc = 0;
-        global_sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
-
-        const local_sym_index = @intCast(u32, self.locals.items.len);
-        const local_sym = try self.locals.addOne(self.base.allocator);
-        local_sym.* = .{
-            .n_strx = global_sym.n_strx,
+        sym.* = .{
+            .n_strx = sym.n_strx,
             .n_type = macho.N_SECT,
-            .n_sect = global_sym.n_sect,
+            .n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1),
             .n_desc = 0,
             .n_value = 0,
         };
 
-        const resolv = self.symbol_resolver.getPtr(local_sym.n_strx) orelse unreachable;
-        resolv.local_sym_index = local_sym_index;
-
-        const atom = try self.createEmptyAtom(local_sym_index, size, alignment);
+        const atom = try self.createEmptyAtom(global.sym_index, size, alignment);
 
         if (self.needs_prealloc) {
             const alignment_pow_2 = try math.powi(u32, 2, alignment);
             const vaddr = try self.allocateAtom(atom, size, alignment_pow_2, match);
-            local_sym.n_value = vaddr;
-            global_sym.n_value = vaddr;
+            sym.n_value = vaddr;
         } else try self.addAtomToSection(atom, match);
     }
 }
@@ -2809,7 +2764,7 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
                 .sym_index = sym_index,
                 .file = object_id,
             };
-            if (sym.undf()) {
+            if (sym.undf() and !sym.tentative()) {
                 try self.unresolved.putNoClobber(gpa, global_index, {});
             }
             continue;
@@ -2927,6 +2882,49 @@ fn resolveSymbolsInDylibs(self: *MachO) !void {
             assert(self.unresolved.swapRemove(global_index));
 
             continue :loop;
+        }
+
+        next_sym += 1;
+    }
+}
+
+fn resolveSymbolsAtLoading(self: *MachO) !void {
+    const is_lib = self.base.options.output_mode == .Lib;
+    const is_dyn_lib = self.base.options.link_mode == .Dynamic and is_lib;
+    const allow_undef = is_dyn_lib and (self.base.options.allow_shlib_undefined orelse false);
+
+    var next_sym: usize = 0;
+    while (next_sym < self.unresolved.count()) {
+        const global_index = self.unresolved.keys()[next_sym];
+        const global = self.globals.values()[global_index];
+        const sym = self.getSymbolPtr(global);
+        const sym_name = self.getSymbolName(global);
+
+        if (sym.discarded()) {
+            sym.* = .{
+                .n_strx = 0,
+                .n_type = macho.N_UNDF,
+                .n_sect = 0,
+                .n_desc = 0,
+                .n_value = 0,
+            };
+            _ = self.unresolved.swapRemove(global_index);
+            continue;
+        } else if (allow_undef) {
+            const n_desc = @bitCast(
+                u16,
+                macho.BIND_SPECIAL_DYLIB_FLAT_LOOKUP * @intCast(i16, macho.N_SYMBOL_RESOLVER),
+            );
+            // TODO allow_shlib_undefined is an ELF flag so figure out macOS specific flags too.
+            sym.n_type = macho.N_EXT;
+            sym.n_desc = n_desc;
+            _ = self.unresolved.swapRemove(global_index);
+            continue;
+        }
+
+        log.err("undefined reference to symbol '{s}'", .{sym_name});
+        if (global.file) |file| {
+            log.err("  first referenced in '{s}'", .{self.objects.items[file].name});
         }
 
         next_sym += 1;
@@ -6782,22 +6780,34 @@ fn logSymtab(self: MachO) void {
     for (self.objects.items) |object, id| {
         log.warn("  object({d}): {s}", .{ id, object.name });
         for (object.symtab.items) |sym, sym_id| {
-            log.warn("    %{d}: {s} @{x} in sect({d}), {s}", .{
+            const where = if (sym.undf() and !sym.tentative()) "ord" else "sect";
+            const def_index = if (sym.undf() and !sym.tentative())
+                @divTrunc(sym.n_desc, macho.N_SYMBOL_RESOLVER)
+            else
+                sym.n_sect;
+            log.warn("    %{d}: {s} @{x} in {s}({d}), {s}", .{
                 sym_id,
                 object.getString(sym.n_strx),
                 sym.n_value,
-                sym.n_sect,
+                where,
+                def_index,
                 logSymAttributes(sym, &buf),
             });
         }
     }
     log.warn("  object(null)", .{});
-    for (self.locals.items) |sym, id| {
-        log.warn("    %{d}: {s} @{x} in sect({d}), {s}", .{
-            id,
+    for (self.locals.items) |sym, sym_id| {
+        const where = if (sym.undf() and !sym.tentative()) "ord" else "sect";
+        const def_index = if (sym.undf() and !sym.tentative())
+            @divTrunc(sym.n_desc, macho.N_SYMBOL_RESOLVER)
+        else
+            sym.n_sect;
+        log.warn("    %{d}: {s} @{x} in {s}({d}), {s}", .{
+            sym_id,
             self.strtab.get(sym.n_strx),
             sym.n_value,
-            sym.n_sect,
+            where,
+            def_index,
             logSymAttributes(sym, &buf),
         });
     }
