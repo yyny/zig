@@ -204,12 +204,10 @@ atom_free_lists: std.AutoHashMapUnmanaged(MatchingSection, std.ArrayListUnmanage
 /// Pointer to the last allocated atom
 atoms: std.AutoHashMapUnmanaged(MatchingSection, *Atom) = .{},
 
-/// List of atoms that are owned directly by the linker.
-/// Currently these are only atoms that are the result of linking
-/// object files. Atoms which take part in incremental linking are
-/// at present owned by Module.Decl.
-/// TODO consolidate this.
+/// List of atoms that are either synthetic or map directly to the Zig source program.
 managed_atoms: std.ArrayListUnmanaged(*Atom) = .{},
+
+/// Table of atoms indexed by the symbol index.
 atom_by_index_table: std.AutoHashMapUnmanaged(u32, *Atom) = .{},
 
 /// Table of unnamed constants associated with a parent `Decl`.
@@ -3032,175 +3030,6 @@ fn resolveDyldStubBinder(self: *MachO) !void {
     } else try self.addAtomToSection(atom, match);
 
     atom_sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
-}
-
-fn parseObjectsIntoAtoms(self: *MachO) !void {
-    // TODO I need to see if I can simplify this logic, or perhaps split it into two functions:
-    // one for non-prealloc traditional path, and one for incremental prealloc path.
-    const tracy = trace(@src());
-    defer tracy.end();
-
-    var parsed_atoms = std.AutoArrayHashMap(MatchingSection, *Atom).init(self.base.allocator);
-    defer parsed_atoms.deinit();
-
-    var first_atoms = std.AutoArrayHashMap(MatchingSection, *Atom).init(self.base.allocator);
-    defer first_atoms.deinit();
-
-    var section_metadata = std.AutoHashMap(MatchingSection, struct {
-        size: u64,
-        alignment: u32,
-    }).init(self.base.allocator);
-    defer section_metadata.deinit();
-
-    for (self.objects.items) |*object| {
-        if (object.analyzed) continue;
-
-        try object.parseIntoAtoms(self.base.allocator, self);
-
-        var it = object.end_atoms.iterator();
-        while (it.next()) |entry| {
-            const match = entry.key_ptr.*;
-            var atom = entry.value_ptr.*;
-
-            while (atom.prev) |prev| {
-                atom = prev;
-            }
-
-            const first_atom = atom;
-
-            const seg = self.load_commands.items[match.seg].segment;
-            const sect = seg.sections.items[match.sect];
-            const metadata = try section_metadata.getOrPut(match);
-            if (!metadata.found_existing) {
-                metadata.value_ptr.* = .{
-                    .size = sect.size,
-                    .alignment = sect.@"align",
-                };
-            }
-
-            log.debug("{s},{s}", .{ sect.segName(), sect.sectName() });
-
-            while (true) {
-                const alignment = try math.powi(u32, 2, atom.alignment);
-                const curr_size = metadata.value_ptr.size;
-                const curr_size_aligned = mem.alignForwardGeneric(u64, curr_size, alignment);
-                metadata.value_ptr.size = curr_size_aligned + atom.size;
-                metadata.value_ptr.alignment = math.max(metadata.value_ptr.alignment, atom.alignment);
-
-                const sym = self.locals.items[atom.sym_index];
-                log.debug("  {s}: n_value=0x{x}, size=0x{x}, alignment=0x{x}", .{
-                    self.getString(sym.n_strx),
-                    sym.n_value,
-                    atom.size,
-                    atom.alignment,
-                });
-
-                if (atom.next) |next| {
-                    atom = next;
-                } else break;
-            }
-
-            if (parsed_atoms.getPtr(match)) |last| {
-                last.*.next = first_atom;
-                first_atom.prev = last.*;
-                last.* = first_atom;
-            }
-            _ = try parsed_atoms.put(match, atom);
-
-            if (!first_atoms.contains(match)) {
-                try first_atoms.putNoClobber(match, first_atom);
-            }
-        }
-
-        object.analyzed = true;
-    }
-
-    var it = section_metadata.iterator();
-    while (it.next()) |entry| {
-        const match = entry.key_ptr.*;
-        const metadata = entry.value_ptr.*;
-        const seg = &self.load_commands.items[match.seg].segment;
-        const sect = &seg.sections.items[match.sect];
-        log.debug("{s},{s} => size: 0x{x}, alignment: 0x{x}", .{
-            sect.segName(),
-            sect.sectName(),
-            metadata.size,
-            metadata.alignment,
-        });
-
-        sect.@"align" = math.max(sect.@"align", metadata.alignment);
-        const needed_size = @intCast(u32, metadata.size);
-
-        if (self.needs_prealloc) {
-            try self.growSection(match, needed_size);
-        }
-        sect.size = needed_size;
-    }
-
-    for (&[_]?u16{
-        self.text_segment_cmd_index,
-        self.data_const_segment_cmd_index,
-        self.data_segment_cmd_index,
-    }) |maybe_seg_id| {
-        const seg_id = maybe_seg_id orelse continue;
-        const seg = self.load_commands.items[seg_id].segment;
-
-        for (seg.sections.items) |sect, sect_id| {
-            const match = MatchingSection{
-                .seg = seg_id,
-                .sect = @intCast(u16, sect_id),
-            };
-            if (!section_metadata.contains(match)) continue;
-
-            var base_vaddr = if (self.atoms.get(match)) |last| blk: {
-                const last_atom_sym = self.locals.items[last.sym_index];
-                break :blk last_atom_sym.n_value + last.size;
-            } else sect.addr;
-
-            if (self.atoms.getPtr(match)) |last| {
-                const first_atom = first_atoms.get(match).?;
-                last.*.next = first_atom;
-                first_atom.prev = last.*;
-                last.* = first_atom;
-            }
-            _ = try self.atoms.put(self.base.allocator, match, parsed_atoms.get(match).?);
-
-            if (!self.needs_prealloc) continue;
-
-            const n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
-
-            var atom = first_atoms.get(match).?;
-            while (true) {
-                const alignment = try math.powi(u32, 2, atom.alignment);
-                base_vaddr = mem.alignForwardGeneric(u64, base_vaddr, alignment);
-
-                const sym = &self.locals.items[atom.sym_index];
-                sym.n_value = base_vaddr;
-                sym.n_sect = n_sect;
-
-                log.debug("  {s}: start=0x{x}, end=0x{x}, size=0x{x}, alignment=0x{x}", .{
-                    self.getString(sym.n_strx),
-                    base_vaddr,
-                    base_vaddr + atom.size,
-                    atom.size,
-                    atom.alignment,
-                });
-
-                // Update each symbol contained within the atom
-                for (atom.contained.items) |sym_at_off| {
-                    const contained_sym = &self.locals.items[sym_at_off.sym_index];
-                    contained_sym.n_value = base_vaddr + sym_at_off.offset;
-                    contained_sym.n_sect = n_sect;
-                }
-
-                base_vaddr += atom.size;
-
-                if (atom.next) |next| {
-                    atom = next;
-                } else break;
-            }
-        }
-    }
 }
 
 fn addLoadDylibLC(self: *MachO, id: u16) !void {
@@ -6481,6 +6310,7 @@ pub fn symbolIsTemp(sym: macho.nlist_64, sym_name: []const u8) bool {
     return mem.startsWith(u8, sym_name, "l") or mem.startsWith(u8, sym_name, "L");
 }
 
+/// Returns pointer-to-symbol described by `sym_with_loc` descriptor.
 pub fn getSymbolPtr(self: *MachO, sym_with_loc: SymbolWithLoc) *macho.nlist_64 {
     if (sym_with_loc.file) |file| {
         const object = &self.objects.items[file];
@@ -6490,10 +6320,12 @@ pub fn getSymbolPtr(self: *MachO, sym_with_loc: SymbolWithLoc) *macho.nlist_64 {
     }
 }
 
+/// Returns symbol described by `sym_with_loc` descriptor.
 pub fn getSymbol(self: *MachO, sym_with_loc: SymbolWithLoc) macho.nlist_64 {
     return self.getSymbolPtr(sym_with_loc).*;
 }
 
+/// Returns name of the symbol described by `sym_with_loc` descriptor.
 pub fn getSymbolName(self: *MachO, sym_with_loc: SymbolWithLoc) []const u8 {
     if (sym_with_loc.file) |file| {
         const object = self.objects.items[file];
@@ -6505,6 +6337,8 @@ pub fn getSymbolName(self: *MachO, sym_with_loc: SymbolWithLoc) []const u8 {
     }
 }
 
+/// Returns atom if there is an atom referenced by the symbol described by `sym_with_loc` descriptor.
+/// Returns null on failure.
 pub fn getAtomForSymbol(self: *MachO, sym_with_loc: SymbolWithLoc) ?*Atom {
     if (sym_with_loc.file) |file| {
         const object = self.objects.items[file];

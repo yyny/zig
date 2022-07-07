@@ -58,8 +58,12 @@ tu_comp_dir: ?[]const u8 = null,
 mtime: ?u64 = null,
 
 sections_as_symbols: std.AutoHashMapUnmanaged(u16, u32) = .{},
-atom_by_index_table: std.AutoHashMapUnmanaged(u32, *Atom) = .{},
+
+/// List of atoms that map to the symbols parsed from this object file.
 managed_atoms: std.ArrayListUnmanaged(*Atom) = .{},
+
+/// Table of atoms belonging to this object file indexed by the symbol index.
+atom_by_index_table: std.AutoHashMapUnmanaged(u32, *Atom) = .{},
 
 const DebugInfo = struct {
     inner: dwarf.DwarfInfo,
@@ -146,80 +150,6 @@ pub fn deinit(self: *Object, gpa: Allocator) void {
 
     if (self.debug_info) |*db| {
         db.deinit(gpa);
-    }
-}
-
-pub fn free(self: *Object, allocator: Allocator, macho_file: *MachO) void {
-    log.debug("freeObject {*}", .{self});
-
-    var it = self.end_atoms.iterator();
-    while (it.next()) |entry| {
-        const match = entry.key_ptr.*;
-        const first_atom = self.start_atoms.get(match).?;
-        const last_atom = entry.value_ptr.*;
-        var atom = first_atom;
-
-        while (true) {
-            if (atom.sym_index != 0) {
-                macho_file.locals_free_list.append(allocator, atom.sym_index) catch {};
-                const local = &macho_file.locals.items[atom.sym_index];
-                local.* = .{
-                    .n_strx = 0,
-                    .n_type = 0,
-                    .n_sect = 0,
-                    .n_desc = 0,
-                    .n_value = 0,
-                };
-                _ = macho_file.atom_by_index_table.remove(atom.sym_index);
-                _ = macho_file.gc_roots.remove(atom);
-
-                for (atom.contained.items) |sym_off| {
-                    _ = macho_file.atom_by_index_table.remove(sym_off.sym_index);
-                }
-
-                atom.sym_index = 0;
-            }
-            if (atom == last_atom) {
-                break;
-            }
-            if (atom.next) |next| {
-                atom = next;
-            } else break;
-        }
-    }
-
-    self.freeAtoms(macho_file);
-}
-
-fn freeAtoms(self: *Object, macho_file: *MachO) void {
-    var it = self.end_atoms.iterator();
-    while (it.next()) |entry| {
-        const match = entry.key_ptr.*;
-        var first_atom: *Atom = self.start_atoms.get(match).?;
-        var last_atom: *Atom = entry.value_ptr.*;
-
-        if (macho_file.atoms.getPtr(match)) |atom_ptr| {
-            if (atom_ptr.* == last_atom) {
-                if (first_atom.prev) |prev| {
-                    // TODO shrink the section size here
-                    atom_ptr.* = prev;
-                } else {
-                    _ = macho_file.atoms.fetchRemove(match);
-                }
-            }
-        }
-
-        if (first_atom.prev) |prev| {
-            prev.next = last_atom.next;
-        } else {
-            first_atom.prev = null;
-        }
-
-        if (last_atom.next) |next| {
-            next.prev = last_atom.prev;
-        } else {
-            last_atom.next = null;
-        }
     }
 }
 
