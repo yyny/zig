@@ -24,7 +24,7 @@ const SymbolWithLoc = MachO.SymbolWithLoc;
 /// the symbol references, and adding that to the file offset of the section.
 /// If this field is 0, it means the codegen size = 0 and there is no symbol or
 /// offset table entry.
-local_sym_index: u32,
+sym_index: u32,
 
 /// null means symbol defined by Zig source.
 file: ?u32,
@@ -76,7 +76,7 @@ pub const Binding = struct {
 };
 
 pub const SymbolAtOffset = struct {
-    local_sym_index: u32,
+    sym_index: u32,
     offset: u64,
     stab: ?Stab = null,
 };
@@ -86,11 +86,11 @@ pub const Stab = union(enum) {
     static,
     global,
 
-    pub fn asNlists(stab: Stab, local_sym_index: u32, macho_file: anytype) ![]macho.nlist_64 {
+    pub fn asNlists(stab: Stab, sym_index: u32, macho_file: anytype) ![]macho.nlist_64 {
         var nlists = std.ArrayList(macho.nlist_64).init(macho_file.base.allocator);
         defer nlists.deinit();
 
-        const sym = macho_file.locals.items[local_sym_index];
+        const sym = macho_file.locals.items[sym_index];
         switch (stab) {
             .function => |size| {
                 try nlists.ensureUnusedCapacity(4);
@@ -171,7 +171,7 @@ pub const Relocation = struct {
 };
 
 pub const empty = Atom{
-    .local_sym_index = 0,
+    .sym_index = 0,
     .file = null,
     .size = 0,
     .alignment = 0,
@@ -206,14 +206,14 @@ pub fn getSymbol(self: Atom, macho_file: *MachO) macho.nlist_64 {
 
 pub fn getSymbolPtr(self: Atom, macho_file: *MachO) *macho.nlist_64 {
     return macho_file.getSymbolPtr(.{
-        .sym_index = self.local_sym_index,
+        .sym_index = self.sym_index,
         .file = self.file,
     });
 }
 
 pub fn getName(self: Atom, macho_file: *MachO) []const u8 {
     return macho_file.getSymbolName(.{
-        .sym_index = self.local_sym_index,
+        .sym_index = self.sym_index,
         .file = self.file,
     });
 }
@@ -222,9 +222,9 @@ pub fn getName(self: Atom, macho_file: *MachO) []const u8 {
 /// File offset relocation happens transparently, so it is not included in
 /// this calculation.
 pub fn capacity(self: Atom, macho_file: MachO) u64 {
-    const self_sym = macho_file.locals.items[self.local_sym_index];
+    const self_sym = macho_file.locals.items[self.sym_index];
     if (self.next) |next| {
-        const next_sym = macho_file.locals.items[next.local_sym_index];
+        const next_sym = macho_file.locals.items[next.sym_index];
         return next_sym.n_value - self_sym.n_value;
     } else {
         // We are the last atom.
@@ -236,8 +236,8 @@ pub fn capacity(self: Atom, macho_file: MachO) u64 {
 pub fn freeListEligible(self: Atom, macho_file: MachO) bool {
     // No need to keep a free list node for the last atom.
     const next = self.next orelse return false;
-    const self_sym = macho_file.locals.items[self.local_sym_index];
-    const next_sym = macho_file.locals.items[next.local_sym_index];
+    const self_sym = macho_file.locals.items[self.sym_index];
+    const next_sym = macho_file.locals.items[next.sym_index];
     const cap = next_sym.n_value - self_sym.n_value;
     const ideal_cap = MachO.padToIdeal(self.size);
     if (cap <= ideal_cap) return false;
