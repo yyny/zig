@@ -269,7 +269,7 @@ const SymbolAtIndex = struct {
 
     fn getSymbolName(self: SymbolAtIndex, object: *Object) []const u8 {
         const sym = self.getSymbol(object);
-        return if (sym.n_strx == 0) "" else object.getString(sym);
+        return if (sym.n_strx == 0) "" else object.getString(sym.n_strx);
     }
 
     const SortContext = struct {
@@ -406,6 +406,28 @@ pub fn splitIntoAtomsWhole(self: *Object, macho_file: *MachO, object_id: u32) !v
     // We only care about defined symbols, so filter every other out.
     const sorted_syms = sorted_all_syms.items[0..iundefsym];
 
+    log.warn("\n\n>>>> ALL SYMBOLS:", .{});
+    for (sorted_all_syms.items) |sym_index| {
+        var buf: [4]u8 = undefined;
+        log.warn("  %{d} => {s}@{x} {s}", .{
+            sym_index.index,
+            sym_index.getSymbolName(self),
+            sym_index.getSymbol(self).n_value,
+            MachO.logSymAttributes(sym_index.getSymbol(self), &buf),
+        });
+    }
+    log.warn("\n\n", .{});
+
+    log.warn("\n\n>>>> ALL DEF SYMBOLS:", .{});
+    for (sorted_syms) |sym_index| {
+        log.warn("  %{d} => {s}@{x}", .{
+            sym_index.index,
+            sym_index.getSymbolName(self),
+            sym_index.getSymbol(self).n_value,
+        });
+    }
+    log.warn("\n\n", .{});
+
     const dead_strip = macho_file.base.options.gc_sections orelse false;
     const subsections_via_symbols = self.header.flags & macho.MH_SUBSECTIONS_VIA_SYMBOLS != 0 and
         (macho_file.base.options.optimize_mode != .Debug or dead_strip);
@@ -416,7 +438,7 @@ pub fn splitIntoAtomsWhole(self: *Object, macho_file: *MachO, object_id: u32) !v
 
         // Get matching segment/section in the final artifact.
         const match = (try macho_file.getMatchingSection(sect)) orelse {
-            log.warn("unhandled section", .{});
+            log.warn("  unhandled section", .{});
             continue;
         };
         const target_sect = macho_file.getSection(match);
@@ -443,6 +465,16 @@ pub fn splitIntoAtomsWhole(self: *Object, macho_file: *MachO, object_id: u32) !v
             sect.addr,
             sect.addr + sect.size,
         );
+
+        log.warn("\n\n>>>> SYMBOLS:", .{});
+        for (filtered_syms) |sym_index| {
+            log.warn("  %{d} => {s}@{x}", .{
+                sym_index.index,
+                sym_index.getSymbolName(self),
+                sym_index.getSymbol(self).n_value,
+            });
+        }
+        log.warn("\n\n", .{});
 
         macho_file.has_dices = macho_file.has_dices or blk: {
             if (self.text_section_index) |index| {
@@ -563,6 +595,9 @@ pub fn splitIntoAtomsWhole(self: *Object, macho_file: *MachO, object_id: u32) !v
                 sect,
             );
             try macho_file.addAtomToSection(atom, match);
+            log.warn("\n\n>>> WAT", .{});
+            macho_file.logAtom(atom);
+            log.warn("\n\n", .{});
         }
     }
 }

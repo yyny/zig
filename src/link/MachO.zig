@@ -2085,7 +2085,7 @@ fn allocateSymbols(self: *MachO) !void {
             sym.n_value = base_vaddr;
             sym.n_sect = n_sect;
 
-            log.warn("  %{d}: {s} allocated at 0x{x}", .{ atom.sym_index, atom.getName(self), base_vaddr });
+            log.warn("  ATOM(%{d}, '{s}') @{x}", .{ atom.sym_index, atom.getName(self), base_vaddr });
 
             // Update each symbol contained within the atom
             for (atom.contained.items) |sym_at_off| {
@@ -2739,15 +2739,23 @@ fn createMhExecuteHeaderSymbol(self: *MachO) !void {
 }
 
 fn createDsoHandleSymbol(self: *MachO) !void {
-    const global = self.globals.get("___dso_handle") orelse return;
-    const sym = self.getSymbolPtr(global);
+    const global = self.globals.getPtr("___dso_handle") orelse return;
+    const sym = self.getSymbolPtr(global.*);
     if (!sym.undf()) return;
-    sym.* = .{
-        .n_strx = sym.n_strx,
+
+    const gpa = self.base.allocator;
+    const n_strx = try self.strtab.insert(gpa, "___dso_handle");
+    const sym_index = @intCast(u32, self.locals.items.len);
+    try self.locals.append(gpa, .{
+        .n_strx = n_strx,
         .n_type = macho.N_SECT | macho.N_EXT,
         .n_sect = 0,
         .n_desc = macho.N_WEAK_DEF,
         .n_value = 0,
+    });
+    global.* = .{
+        .sym_index = sym_index,
+        .file = null,
     };
     _ = self.unresolved.swapRemove(@intCast(u32, self.globals.getIndex("___dso_handle").?));
 }
@@ -5746,6 +5754,7 @@ fn writeFunctionStarts(self: *MachO) !void {
     var offsets = std.ArrayList(u32).init(gpa);
     defer offsets.deinit();
 
+    // TODO need to sort by address!
     var last_off: u32 = 0;
     for (self.globals.values()) |global| {
         const sym = self.getSymbol(global);
@@ -6087,7 +6096,7 @@ fn writeLinkeditSegment(self: *MachO) !void {
     seg.inner.filesize = 0;
 
     try self.writeDyldInfoData();
-    try self.writeFunctionStarts();
+    // try self.writeFunctionStarts();
     try self.writeDices();
     try self.writeSymbolTable();
     try self.writeStringTable();
@@ -6605,7 +6614,7 @@ fn snapshotState(self: *MachO) !void {
     try writer.writeByte(']');
 }
 
-fn logSymAttributes(sym: macho.nlist_64, buf: *[4]u8) []const u8 {
+pub fn logSymAttributes(sym: macho.nlist_64, buf: *[4]u8) []const u8 {
     mem.set(u8, buf, '_');
     if (sym.sect()) {
         buf[0] = 's';
@@ -6744,7 +6753,7 @@ fn logAtoms(self: *MachO) void {
     }
 }
 
-fn logAtom(self: *MachO, atom: *const Atom) void {
+pub fn logAtom(self: *MachO, atom: *const Atom) void {
     const sym = atom.getSymbol(self);
     const sym_name = atom.getName(self);
     log.warn("  ATOM(%{d}, '{s}') @ {x} in object({d})", .{

@@ -200,15 +200,11 @@ pub const Relocation = struct {
             return macho_file.got_entries.items[got_index].atom;
         }
 
-        if (target_sym.undf()) {
-            if (macho_file.stubs_table.get(self.target)) |stub_index| {
-                return macho_file.stubs.items[stub_index].atom;
-            } else if (macho_file.tlv_ptr_entries_table.get(self.target)) |tlv_ptr_index| {
-                return macho_file.tlv_ptr_entries.items[tlv_ptr_index].atom;
-            } else return null;
-        } else {
-            return macho_file.getAtomForSymbol(self.target);
-        }
+        if (macho_file.stubs_table.get(self.target)) |stub_index| {
+            return macho_file.stubs.items[stub_index].atom;
+        } else if (macho_file.tlv_ptr_entries_table.get(self.target)) |tlv_ptr_index| {
+            return macho_file.tlv_ptr_entries.items[tlv_ptr_index].atom;
+        } else return macho_file.getAtomForSymbol(self.target);
     }
 };
 
@@ -725,7 +721,15 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
         };
         const target_addr = blk: {
             const target_atom = (try rel.getTargetAtom(macho_file)) orelse {
-                log.warn("  | undef target '{s}'", .{macho_file.getSymbolName(rel.target)});
+                // If there is no atom for target, we still need to check for special, atom-less
+                // symbols such as `___dso_handle`.
+                const target_name = macho_file.getSymbolName(rel.target);
+                if (macho_file.globals.contains(target_name)) {
+                    const atomless_sym = macho_file.getSymbol(rel.target);
+                    log.warn("  | atomless target '{s}'", .{target_name});
+                    break :blk atomless_sym.n_value;
+                }
+                log.warn("  | undef target '{s}'", .{target_name});
                 break :blk 0;
             };
             log.warn("  | target ATOM(%{d}, '{s}') in object({d})", .{
