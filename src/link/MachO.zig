@@ -5741,6 +5741,8 @@ fn populateLazyBindOffsetsInStubHelper(self: *MachO, buffer: []const u8) !void {
     }
 }
 
+const asc_u64 = std.sort.asc(u64);
+
 fn writeFunctionStarts(self: *MachO) !void {
     const text_seg_index = self.text_segment_cmd_index orelse return;
     const text_sect_index = self.text_section_index orelse return;
@@ -5751,11 +5753,11 @@ fn writeFunctionStarts(self: *MachO) !void {
 
     const gpa = self.base.allocator;
 
-    var offsets = std.ArrayList(u32).init(gpa);
-    defer offsets.deinit();
+    // We need to sort by address first
+    var addresses = std.ArrayList(u64).init(gpa);
+    defer addresses.deinit();
+    try addresses.ensureTotalCapacityPrecise(self.globals.count());
 
-    // TODO need to sort by address!
-    var last_off: u32 = 0;
     for (self.globals.values()) |global| {
         const sym = self.getSymbol(global);
         if (sym.undf()) continue;
@@ -5763,12 +5765,23 @@ fn writeFunctionStarts(self: *MachO) !void {
         const match = self.getMatchingSectionFromOrdinal(sym.n_sect);
         if (match.seg != text_seg_index or match.sect != text_sect_index) continue;
 
-        const offset = @intCast(u32, sym.n_value - text_seg.inner.vmaddr);
+        addresses.appendAssumeCapacity(sym.n_value);
+    }
+
+    std.sort.sort(u64, addresses.items, {}, asc_u64);
+
+    var offsets = std.ArrayList(u32).init(gpa);
+    defer offsets.deinit();
+    try offsets.ensureTotalCapacityPrecise(addresses.items.len);
+
+    var last_off: u32 = 0;
+    for (addresses.items) |addr| {
+        const offset = @intCast(u32, addr - text_seg.inner.vmaddr);
         const diff = offset - last_off;
 
         if (diff == 0) continue;
 
-        try offsets.append(diff);
+        offsets.appendAssumeCapacity(diff);
         last_off = offset;
     }
 
@@ -6096,7 +6109,7 @@ fn writeLinkeditSegment(self: *MachO) !void {
     seg.inner.filesize = 0;
 
     try self.writeDyldInfoData();
-    // try self.writeFunctionStarts();
+    try self.writeFunctionStarts();
     try self.writeDices();
     try self.writeSymbolTable();
     try self.writeStringTable();
