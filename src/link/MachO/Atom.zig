@@ -704,13 +704,13 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
-    log.debug("ATOM(%{d}, '{s}')", .{ self.sym_index, self.getName(macho_file) });
+    log.warn("ATOM(%{d}, '{s}')", .{ self.sym_index, self.getName(macho_file) });
 
     for (self.relocs.items) |rel| {
         const arch = macho_file.base.options.target.cpu.arch;
         switch (arch) {
             .aarch64 => {
-                log.debug("  RELA({s}) @ {x} => %{d} in object({d})", .{
+                log.warn("  RELA({s}) @ {x} => %{d} in object({d})", .{
                     @tagName(@intToEnum(macho.reloc_type_arm64, rel.@"type")),
                     rel.offset,
                     rel.target.sym_index,
@@ -718,7 +718,7 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
                 });
             },
             .x86_64 => {
-                log.debug("  RELA({s}) @ {x} => %{d} in object({d})", .{
+                log.warn("  RELA({s}) @ {x} => %{d} in object({d})", .{
                     @tagName(@intToEnum(macho.reloc_type_x86_64, rel.@"type")),
                     rel.offset,
                     rel.target.sym_index,
@@ -745,13 +745,13 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
                 const target_name = macho_file.getSymbolName(rel.target);
                 if (macho_file.globals.contains(target_name)) {
                     const atomless_sym = macho_file.getSymbol(rel.target);
-                    log.debug("    | atomless target '{s}'", .{target_name});
+                    log.warn("    | atomless target '{s}'", .{target_name});
                     break :blk atomless_sym.n_value;
                 }
-                log.debug("    | undef target '{s}'", .{target_name});
+                log.warn("    | undef target '{s}'", .{target_name});
                 break :blk 0;
             };
-            log.debug("    | target ATOM(%{d}, '{s}') in object({d})", .{
+            log.warn("    | target ATOM(%{d}, '{s}') in object({d})", .{
                 target_atom.sym_index,
                 target_atom.getName(macho_file),
                 target_atom.file,
@@ -783,8 +783,8 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
             break :blk target_sym.n_value - base_address;
         };
 
-        log.debug("    | source_addr = 0x{x}", .{source_addr});
-        log.debug("    | target_addr = 0x{x}", .{target_addr});
+        log.warn("    | source_addr = 0x{x}", .{source_addr});
+        log.warn("    | target_addr = 0x{x}", .{target_addr});
 
         switch (arch) {
             .aarch64 => {
