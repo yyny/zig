@@ -168,7 +168,7 @@ pub fn parse(self: *Object, allocator: Allocator, target: std.Target) !void {
 
     self.header = try reader.readStruct(macho.mach_header_64);
     if (self.header.filetype != macho.MH_OBJECT) {
-        log.debug("invalid filetype: expected 0x{x}, found 0x{x}", .{
+        log.warn("invalid filetype: expected 0x{x}, found 0x{x}", .{
             macho.MH_OBJECT,
             self.header.filetype,
         });
@@ -245,7 +245,7 @@ pub fn parse(self: *Object, allocator: Allocator, target: std.Target) !void {
                 cmd.linkedit_data.dataoff += file_offset;
             },
             else => {
-                log.debug("Unknown load command detected: 0x{x}.", .{cmd.cmd()});
+                log.warn("Unknown load command detected: 0x{x}.", .{cmd.cmd()});
             },
         }
         self.load_commands.appendAssumeCapacity(cmd);
@@ -416,7 +416,7 @@ pub fn splitIntoAtomsWhole(self: *Object, macho_file: *MachO, object_id: u32) !v
 
         // Get matching segment/section in the final artifact.
         const match = (try macho_file.getMatchingSection(sect)) orelse {
-            log.debug("unhandled section", .{});
+            log.warn("unhandled section", .{});
             continue;
         };
 
@@ -685,7 +685,7 @@ fn parseSymtab(self: *Object, allocator: Allocator) !void {
 }
 
 fn parseDebugInfo(self: *Object, allocator: Allocator) !void {
-    log.debug("parsing debug info in '{s}'", .{self.name});
+    log.warn("parsing debug info in '{s}'", .{self.name});
 
     var debug_info = blk: {
         var di = try DebugInfo.parseFromObject(allocator, self);
@@ -696,7 +696,7 @@ fn parseDebugInfo(self: *Object, allocator: Allocator) !void {
     const compile_unit = debug_info.inner.findCompileUnit(0x0) catch |err| switch (err) {
         error.MissingDebugInfo => {
             // TODO audit cases with missing debug info and audit our dwarf.zig module.
-            log.debug("invalid or missing debug info in {s}; skipping", .{self.name});
+            log.warn("invalid or missing debug info in {s}; skipping", .{self.name});
             return;
         },
         else => |e| return e,
@@ -729,7 +729,7 @@ fn parseDataInCode(self: *Object) void {
 fn getSectionContents(self: Object, sect_id: u16) []const u8 {
     const seg = self.load_commands.items[self.segment_cmd_index.?].segment;
     const sect = seg.sections.items[sect_id];
-    log.debug("getting {s},{s} data at 0x{x} - 0x{x}", .{
+    log.warn("getting {s},{s} data at 0x{x} - 0x{x}", .{
         sect.segName(),
         sect.sectName(),
         sect.offset,
