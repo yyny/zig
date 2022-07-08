@@ -369,7 +369,7 @@ pub fn splitIntoAtomsWhole(self: *Object, macho_file: *MachO, object_id: u32) !v
     const gpa = macho_file.base.allocator;
     const seg = self.load_commands.items[self.segment_cmd_index.?].segment;
 
-    log.warn("splitting object({d}, {s}) into atoms: whole cache mode", .{ object_id, self.name });
+    log.debug("splitting object({d}, {s}) into atoms: whole cache mode", .{ object_id, self.name });
 
     // You would expect that the symbol table is at least pre-sorted based on symbol's type:
     // local < extern defined < undefined. Unfortunately, this is not guaranteed! For instance,
@@ -408,18 +408,23 @@ pub fn splitIntoAtomsWhole(self: *Object, macho_file: *MachO, object_id: u32) !v
     const dead_strip = macho_file.base.options.gc_sections orelse false;
     const subsections_via_symbols = self.header.flags & macho.MH_SUBSECTIONS_VIA_SYMBOLS != 0 and
         (macho_file.base.options.optimize_mode != .Debug or dead_strip);
+    // const subsections_via_symbols = self.header.flags & macho.MH_SUBSECTIONS_VIA_SYMBOLS != 0;
 
     for (seg.sections.items) |sect, id| {
         const sect_id = @intCast(u8, id);
-        log.warn("splitting section '{s},{s}' into atoms", .{ sect.segName(), sect.sectName() });
+        log.debug("splitting section '{s},{s}' into atoms", .{ sect.segName(), sect.sectName() });
 
         // Get matching segment/section in the final artifact.
         const match = (try macho_file.getMatchingSection(sect)) orelse {
-            log.warn("  unhandled section", .{});
+            log.debug("  unhandled section", .{});
             continue;
         };
         const target_sect = macho_file.getSection(match);
-        log.warn("  output section '{s},{s}'", .{ target_sect.segName(), target_sect.sectName() });
+        log.debug("  output sect({d}, '{s},{s}')", .{
+            macho_file.getSectionOrdinal(match),
+            target_sect.segName(),
+            target_sect.sectName(),
+        });
 
         const is_zerofill = blk: {
             const section_type = sect.type_();
@@ -464,7 +469,7 @@ pub fn splitIntoAtomsWhole(self: *Object, macho_file: *MachO, object_id: u32) !v
                     try self.symtab.append(gpa, .{
                         .n_strx = 0,
                         .n_type = macho.N_SECT,
-                        .n_sect = @intCast(u8, macho_file.section_ordinals.getIndex(match).? + 1),
+                        .n_sect = macho_file.getSectionOrdinal(match),
                         .n_desc = 0,
                         .n_value = sect.addr,
                     });
@@ -542,7 +547,7 @@ pub fn splitIntoAtomsWhole(self: *Object, macho_file: *MachO, object_id: u32) !v
                 try self.symtab.append(gpa, .{
                     .n_strx = 0,
                     .n_type = macho.N_SECT,
-                    .n_sect = @intCast(u8, macho_file.section_ordinals.getIndex(match).? + 1),
+                    .n_sect = macho_file.getSectionOrdinal(match),
                     .n_desc = 0,
                     .n_value = sect.addr,
                 });
@@ -585,7 +590,7 @@ fn createAtomFromSubsection(
     const aligned_size = mem.alignForwardGeneric(u64, size, align_pow_2);
     const atom = try MachO.createEmptyAtom(gpa, sym_index, aligned_size, alignment);
     atom.file = object_id;
-    sym.n_sect = @intCast(u8, macho_file.section_ordinals.getIndex(match).? + 1);
+    sym.n_sect = macho_file.getSectionOrdinal(match);
 
     try self.atom_by_index_table.putNoClobber(gpa, sym_index, atom);
     try self.managed_atoms.append(gpa, atom);
@@ -624,7 +629,7 @@ fn createAtomFromSubsection(
 
     for (indexes) |inner_sym_index| {
         const inner_sym = inner_sym_index.getSymbolPtr(self);
-        inner_sym.n_sect = @intCast(u8, macho_file.section_ordinals.getIndex(match).? + 1);
+        inner_sym.n_sect = macho_file.getSectionOrdinal(match);
 
         const stab: ?Atom.Stab = if (self.debug_info) |di| blk: {
             // TODO there has to be a better to handle this.
@@ -686,7 +691,7 @@ fn parseSymtab(self: *Object, allocator: Allocator) !void {
 }
 
 fn parseDebugInfo(self: *Object, allocator: Allocator) !void {
-    log.warn("parsing debug info in '{s}'", .{self.name});
+    log.debug("parsing debug info in '{s}'", .{self.name});
 
     var debug_info = blk: {
         var di = try DebugInfo.parseFromObject(allocator, self);
@@ -697,7 +702,7 @@ fn parseDebugInfo(self: *Object, allocator: Allocator) !void {
     const compile_unit = debug_info.inner.findCompileUnit(0x0) catch |err| switch (err) {
         error.MissingDebugInfo => {
             // TODO audit cases with missing debug info and audit our dwarf.zig module.
-            log.warn("invalid or missing debug info in {s}; skipping", .{self.name});
+            log.debug("invalid or missing debug info in {s}; skipping", .{self.name});
             return;
         },
         else => |e| return e,
@@ -729,7 +734,7 @@ fn parseDataInCode(self: *Object) void {
 
 fn getSectionContents(self: Object, sect_id: u16) []const u8 {
     const sect = self.getSection(sect_id);
-    log.warn("getting {s},{s} data at 0x{x} - 0x{x}", .{
+    log.debug("getting {s},{s} data at 0x{x} - 0x{x}", .{
         sect.segName(),
         sect.sectName(),
         sect.offset,

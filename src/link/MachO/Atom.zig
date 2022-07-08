@@ -389,7 +389,7 @@ pub fn parseRelocs(self: *Atom, relocs: []const macho.relocation_info, context: 
                     try object.symtab.append(gpa, .{
                         .n_strx = 0,
                         .n_type = macho.N_SECT,
-                        .n_sect = @intCast(u8, context.macho_file.section_ordinals.getIndex(match).? + 1),
+                        .n_sect = context.macho_file.getSectionOrdinal(match),
                         .n_desc = 0,
                         .n_value = 0,
                     });
@@ -599,7 +599,7 @@ fn addTlvPtrEntry(target: MachO.SymbolWithLoc, context: RelocContext) !void {
         sym.n_value = vaddr;
     } else try context.macho_file.addAtomToSection(atom, match);
 
-    sym.n_sect = @intCast(u8, context.macho_file.section_ordinals.getIndex(match).? + 1);
+    sym.n_sect = context.macho_file.getSectionOrdinal(match);
 }
 
 fn addGotEntry(target: MachO.SymbolWithLoc, context: RelocContext) !void {
@@ -624,7 +624,7 @@ fn addGotEntry(target: MachO.SymbolWithLoc, context: RelocContext) !void {
         sym.n_value = vaddr;
     } else try context.macho_file.addAtomToSection(atom, match);
 
-    sym.n_sect = @intCast(u8, context.macho_file.section_ordinals.getIndex(match).? + 1);
+    sym.n_sect = context.macho_file.getSectionOrdinal(match);
 }
 
 fn addStub(target: MachO.SymbolWithLoc, context: RelocContext) !void {
@@ -652,7 +652,7 @@ fn addStub(target: MachO.SymbolWithLoc, context: RelocContext) !void {
             sym.n_value = vaddr;
         } else try context.macho_file.addAtomToSection(atom, match);
 
-        sym.n_sect = @intCast(u8, context.macho_file.section_ordinals.getIndex(match).? + 1);
+        sym.n_sect = context.macho_file.getSectionOrdinal(match);
 
         break :atom atom;
     };
@@ -674,7 +674,7 @@ fn addStub(target: MachO.SymbolWithLoc, context: RelocContext) !void {
             sym.n_value = vaddr;
         } else try context.macho_file.addAtomToSection(atom, match);
 
-        sym.n_sect = @intCast(u8, context.macho_file.section_ordinals.getIndex(match).? + 1);
+        sym.n_sect = context.macho_file.getSectionOrdinal(match);
 
         break :atom atom;
     };
@@ -695,7 +695,7 @@ fn addStub(target: MachO.SymbolWithLoc, context: RelocContext) !void {
         sym.n_value = vaddr;
     } else try context.macho_file.addAtomToSection(atom, match);
 
-    sym.n_sect = @intCast(u8, context.macho_file.section_ordinals.getIndex(match).? + 1);
+    sym.n_sect = context.macho_file.getSectionOrdinal(match);
 
     context.macho_file.stubs.items[stub_index].atom = atom;
 }
@@ -704,13 +704,13 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
-    log.warn("ATOM(%{d}, '{s}')", .{ self.sym_index, self.getName(macho_file) });
+    log.debug("ATOM(%{d}, '{s}')", .{ self.sym_index, self.getName(macho_file) });
 
     for (self.relocs.items) |rel| {
         const arch = macho_file.base.options.target.cpu.arch;
         switch (arch) {
             .aarch64 => {
-                log.warn("  RELA({s}) @ {x} => %{d} in object({d})", .{
+                log.debug("  RELA({s}) @ {x} => %{d} in object({d})", .{
                     @tagName(@intToEnum(macho.reloc_type_arm64, rel.@"type")),
                     rel.offset,
                     rel.target.sym_index,
@@ -718,7 +718,7 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
                 });
             },
             .x86_64 => {
-                log.warn("  RELA({s}) @ {x} => %{d} in object({d})", .{
+                log.debug("  RELA({s}) @ {x} => %{d} in object({d})", .{
                     @tagName(@intToEnum(macho.reloc_type_x86_64, rel.@"type")),
                     rel.offset,
                     rel.target.sym_index,
@@ -745,13 +745,13 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
                 const target_name = macho_file.getSymbolName(rel.target);
                 if (macho_file.globals.contains(target_name)) {
                     const atomless_sym = macho_file.getSymbol(rel.target);
-                    log.warn("    | atomless target '{s}'", .{target_name});
+                    log.debug("    | atomless target '{s}'", .{target_name});
                     break :blk atomless_sym.n_value;
                 }
-                log.warn("    | undef target '{s}'", .{target_name});
+                log.debug("    | undef target '{s}'", .{target_name});
                 break :blk 0;
             };
-            log.warn("    | target ATOM(%{d}, '{s}') in object({d})", .{
+            log.debug("    | target ATOM(%{d}, '{s}') in object({d})", .{
                 target_atom.sym_index,
                 target_atom.getName(macho_file),
                 target_atom.file,
@@ -763,31 +763,28 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
                 // defined TLV template init section in the following order:
                 // * wrt to __thread_data if defined, then
                 // * wrt to __thread_bss
-                const base_address = inner: {
-                    const sect_id: u16 = sect_id: {
-                        if (macho_file.tlv_data_section_index) |i| {
-                            break :sect_id i;
-                        } else if (macho_file.tlv_bss_section_index) |i| {
-                            break :sect_id i;
-                        } else {
-                            log.err("threadlocal variables present but no initializer sections found", .{});
-                            log.err("  __thread_data not found", .{});
-                            log.err("  __thread_bss not found", .{});
-                            return error.FailedToResolveRelocationTarget;
-                        }
-                    };
-                    break :inner macho_file.getSection(.{
-                        .seg = macho_file.data_const_segment_cmd_index.?,
-                        .sect = sect_id,
-                    }).addr;
+                const sect_id: u16 = sect_id: {
+                    if (macho_file.tlv_data_section_index) |i| {
+                        break :sect_id i;
+                    } else if (macho_file.tlv_bss_section_index) |i| {
+                        break :sect_id i;
+                    } else {
+                        log.err("threadlocal variables present but no initializer sections found", .{});
+                        log.err("  __thread_data not found", .{});
+                        log.err("  __thread_bss not found", .{});
+                        return error.FailedToResolveRelocationTarget;
+                    }
                 };
-                break :base_address base_address;
+                break :base_address macho_file.getSection(.{
+                    .seg = macho_file.data_segment_cmd_index.?,
+                    .sect = sect_id,
+                }).addr;
             } else 0;
             break :blk target_sym.n_value - base_address;
         };
 
-        log.warn("    | source_addr = 0x{x}", .{source_addr});
-        log.warn("    | target_addr = 0x{x}", .{target_addr});
+        log.debug("    | source_addr = 0x{x}", .{source_addr});
+        log.debug("    | target_addr = 0x{x}", .{target_addr});
 
         switch (arch) {
             .aarch64 => {
