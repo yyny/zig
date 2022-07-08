@@ -586,9 +586,7 @@ fn createAtomFromSubsection(
 ) !*Atom {
     const gpa = macho_file.base.allocator;
     const sym = &self.symtab.items[sym_index];
-    const align_pow_2 = try math.powi(u32, 2, alignment);
-    const aligned_size = mem.alignForwardGeneric(u64, size, align_pow_2);
-    const atom = try MachO.createEmptyAtom(gpa, sym_index, aligned_size, alignment);
+    const atom = try MachO.createEmptyAtom(gpa, sym_index, size, alignment);
     atom.file = object_id;
     sym.n_sect = macho_file.getSectionOrdinal(match);
 
