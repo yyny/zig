@@ -419,6 +419,8 @@ pub fn splitIntoAtomsWhole(self: *Object, macho_file: *MachO, object_id: u32) !v
             log.warn("unhandled section", .{});
             continue;
         };
+        const target_sect = macho_file.getSection(match);
+        log.warn("  output section '{s},{s}'", .{ target_sect.segName(), target_sect.sectName() });
 
         const is_zerofill = blk: {
             const section_type = sect.type_();
@@ -727,8 +729,7 @@ fn parseDataInCode(self: *Object) void {
 }
 
 fn getSectionContents(self: Object, sect_id: u16) []const u8 {
-    const seg = self.load_commands.items[self.segment_cmd_index.?].segment;
-    const sect = seg.sections.items[sect_id];
+    const sect = self.getSection(sect_id);
     log.warn("getting {s},{s} data at 0x{x} - 0x{x}", .{
         sect.segName(),
         sect.sectName(),
@@ -741,4 +742,10 @@ fn getSectionContents(self: Object, sect_id: u16) []const u8 {
 pub fn getString(self: Object, off: u32) []const u8 {
     assert(off < self.strtab.len);
     return mem.sliceTo(@ptrCast([*:0]const u8, self.strtab.ptr + off), 0);
+}
+
+pub fn getSection(self: Object, n_sect: u16) macho.section_64 {
+    const seg = self.load_commands.items[self.segment_cmd_index.?].segment;
+    assert(n_sect < seg.sections.items.len);
+    return seg.sections.items[n_sect];
 }

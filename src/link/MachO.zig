@@ -1057,8 +1057,10 @@ pub fn flushModule(self: *MachO, comp: *Compilation, prog_node: *std.Progress.No
         }
 
         if (self.rustc_section_index) |id| {
-            const seg = &self.load_commands.items[self.data_segment_cmd_index.?].segment;
-            const sect = &seg.sections.items[id];
+            const sect = self.getSectionPtr(.{
+                .seg = self.data_segment_cmd_index.?,
+                .sect = id,
+            });
             sect.size = self.rustc_section_size;
         }
 
@@ -2051,12 +2053,11 @@ pub fn createEmptyAtom(gpa: Allocator, sym_index: u32, size: u64, alignment: u32
 }
 
 pub fn writeAtom(self: *MachO, atom: *Atom, match: MatchingSection) !void {
-    const seg = self.load_commands.items[match.seg].segment;
-    const sect = seg.sections.items[match.sect];
-    const sym = self.locals.items[atom.sym_index];
+    const sect = self.getSection(match);
+    const sym = atom.getSymbol(self);
     const file_offset = sect.offset + sym.n_value - sect.addr;
     try atom.resolveRelocs(self);
-    log.warn("writing atom for symbol {s} at file offset 0x{x}", .{ self.getString(sym.n_strx), file_offset });
+    log.warn("writing atom for symbol {s} at file offset 0x{x}", .{ atom.getName(self), file_offset });
     try self.base.file.?.pwriteAll(atom.code.items, file_offset);
 }
 
@@ -2070,9 +2071,8 @@ fn allocateSymbols(self: *MachO) !void {
             atom = prev;
         }
 
-        const n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
-        const seg = self.load_commands.items[match.seg].segment;
-        const sect = seg.sections.items[match.sect];
+        const n_sect = self.getSectionOrdinal(match);
+        const sect = self.getSection(match);
         var base_vaddr = sect.addr;
 
         log.warn("allocating local symbols in {s},{s}", .{ sect.segName(), sect.sectName() });
@@ -2129,10 +2129,10 @@ fn allocateSpecialSymbols(self: *MachO) !void {
         const global = self.globals.get(name) orelse continue;
         const sym = self.getSymbolPtr(global);
         const seg = self.load_commands.items[self.text_segment_cmd_index.?].segment;
-        sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(.{
+        sym.n_sect = self.getSectionOrdinal(.{
             .seg = self.text_segment_cmd_index.?,
             .sect = 0,
-        }).? + 1);
+        });
         sym.n_value = seg.inner.vmaddr;
 
         log.warn("allocating {s} at the start of {s}", .{
@@ -2145,9 +2145,7 @@ fn allocateSpecialSymbols(self: *MachO) !void {
 fn writeAtomsWhole(self: *MachO) !void {
     var it = self.atoms.iterator();
     while (it.next()) |entry| {
-        const match = entry.key_ptr.*;
-        const seg = self.load_commands.items[match.seg].segment;
-        const sect = seg.sections.items[match.sect];
+        const sect = self.getSection(entry.key_ptr.*);
         var atom: *Atom = entry.value_ptr.*;
 
         if (sect.flags == macho.S_ZEROFILL or sect.flags == macho.S_THREAD_LOCAL_ZEROFILL) continue;
@@ -2225,8 +2223,7 @@ fn writeAtoms(self: *MachO) !void {
     var it = self.atoms.iterator();
     while (it.next()) |entry| {
         const match = entry.key_ptr.*;
-        const seg = self.load_commands.items[match.seg].segment;
-        const sect = seg.sections.items[match.sect];
+        const sect = self.getSection(match);
         var atom: *Atom = entry.value_ptr.*;
 
         // TODO handle zerofill in stage2
@@ -2342,7 +2339,7 @@ fn createDyldPrivateAtom(self: *MachO) !void {
         sym.n_value = vaddr;
     } else try self.addAtomToSection(atom, match);
 
-    sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
+    sym.n_sect = self.getSectionOrdinal(match);
 
     try self.managed_atoms.append(gpa, atom);
     try self.atom_by_index_table.putNoClobber(gpa, sym_index, atom);
@@ -2482,7 +2479,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
         sym.n_value = vaddr;
     } else try self.addAtomToSection(atom, match);
 
-    sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
+    sym.n_sect = self.getSectionOrdinal(match);
 
     try self.managed_atoms.append(gpa, atom);
     try self.atom_by_index_table.putNoClobber(gpa, sym_index, atom);
@@ -2696,7 +2693,7 @@ fn createTentativeDefAtoms(self: *MachO) !void {
         sym.* = .{
             .n_strx = sym.n_strx,
             .n_type = macho.N_SECT,
-            .n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1),
+            .n_sect = self.getSectionOrdinal(match),
             .n_desc = 0,
             .n_value = 0,
         };
@@ -3028,7 +3025,7 @@ fn resolveDyldStubBinder(self: *MachO) !void {
         atom_sym.n_value = vaddr;
     } else try self.addAtomToSection(atom, match);
 
-    atom_sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
+    atom_sym.n_sect = self.getSectionOrdinal(match);
 }
 
 fn addLoadDylibLC(self: *MachO, id: u16) !void {
@@ -3497,7 +3494,7 @@ pub fn lowerUnnamedConst(self: *MachO, typed_value: TypedValue, decl_index: Modu
     symbol.* = .{
         .n_strx = name_str_index,
         .n_type = macho.N_SECT,
-        .n_sect = @intCast(u8, self.section_ordinals.getIndex(match).?) + 1,
+        .n_sect = self.getSectionOrdinal(match),
         .n_desc = 0,
         .n_value = addr,
     };
@@ -3728,8 +3725,7 @@ fn getMatchingSectionAtom(
             .@"align" = align_log_2,
         })).?;
     };
-    const seg = self.load_commands.items[match.seg].segment;
-    const sect = seg.sections.items[match.sect];
+    const sect = self.getSection(match);
     log.warn("  allocating atom '{s}' in '{s},{s}' ({d},{d})", .{
         name,
         sect.segName(),
@@ -3793,7 +3789,7 @@ fn placeDecl(self: *MachO, decl_index: Module.Decl.Index, code_len: usize) !*mac
         symbol.* = .{
             .n_strx = name_str_index,
             .n_type = macho.N_SECT,
-            .n_sect = @intCast(u8, self.section_ordinals.getIndex(match).?) + 1,
+            .n_sect = self.getSectionOrdinal(match),
             .n_desc = 0,
             .n_value = addr,
         };
@@ -3805,10 +3801,10 @@ fn placeDecl(self: *MachO, decl_index: Module.Decl.Index, code_len: usize) !*mac
             .sect = self.got_section_index.?,
         });
         got_sym.n_value = vaddr;
-        got_sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(.{
+        got_sym.n_sect = self.getSectionOrdinal(.{
             .seg = self.data_const_segment_cmd_index.?,
             .sect = self.got_section_index.?,
-        }).? + 1);
+        });
     }
 
     return symbol;
@@ -4977,8 +4973,7 @@ pub fn allocateAtom(self: *MachO, atom: *Atom, new_atom_size: u64, alignment: u6
     const tracy = trace(@src());
     defer tracy.end();
 
-    const seg = &self.load_commands.items[match.seg].segment;
-    const sect = &seg.sections.items[match.sect];
+    const sect = self.getSectionPtr(match);
     var free_list = self.atom_free_lists.get(match).?;
     const needs_padding = match.seg == self.text_segment_cmd_index.? and match.sect == self.text_section_index.?;
     const new_atom_ideal_capacity = if (needs_padding) padToIdeal(new_atom_size) else new_atom_size;
@@ -5087,8 +5082,7 @@ pub fn addAtomToSection(self: *MachO, atom: *Atom, match: MatchingSection) !void
     } else {
         try self.atoms.putNoClobber(self.base.allocator, match, atom);
     }
-    const seg = &self.load_commands.items[match.seg].segment;
-    const sect = &seg.sections.items[match.sect];
+    const sect = self.getSectionPtr(match);
     sect.size += atom.size;
 }
 
@@ -5352,8 +5346,7 @@ fn gcAtoms(self: *MachO) !void {
             }
         }
 
-        const seg = &self.load_commands.items[match.seg].segment;
-        const sect = &seg.sections.items[match.sect];
+        const sect = self.getSectionPtr(match);
         var atom = entry.value_ptr.*;
 
         log.warn("GCing atoms in {s},{s}", .{ sect.segName(), sect.sectName() });
@@ -5427,7 +5420,7 @@ fn updateSectionOrdinals(self: *MachO) !void {
                 .seg = @intCast(u16, index),
                 .sect = @intCast(u16, sect_id),
             };
-            const old_ordinal = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
+            const old_ordinal = self.getSectionOrdinal(match);
             new_ordinal += 1;
             try ordinal_remap.putNoClobber(old_ordinal, new_ordinal);
             try ordinals.putNoClobber(gpa, match, {});
@@ -5474,8 +5467,8 @@ fn writeDyldInfoData(self: *MachO) !void {
                 if (match.seg == seg) continue; // __TEXT is non-writable
             }
 
-            const seg = self.load_commands.items[match.seg].segment;
-            const sect = seg.sections.items[match.sect];
+            const seg = self.getSegment(match);
+            const sect = self.getSection(match);
             log.warn("dyld info for {s},{s}", .{ sect.segName(), sect.sectName() });
 
             while (true) {
@@ -5714,10 +5707,10 @@ fn populateLazyBindOffsetsInStubHelper(self: *MachO, buffer: []const u8) !void {
         }
     }
 
-    const sect = blk: {
-        const seg = self.load_commands.items[text_segment_cmd_index].segment;
-        break :blk seg.sections.items[stub_helper_section_index];
-    };
+    const sect = self.getSection(.{
+        .seg = text_segment_cmd_index,
+        .sect = stub_helper_section_index,
+    });
     const stub_offset: u4 = switch (self.base.options.target.cpu.arch) {
         .x86_64 => 1,
         .aarch64 => 2 * @sizeOf(u32),
@@ -5758,7 +5751,7 @@ fn writeFunctionStarts(self: *MachO) !void {
         const sym = self.getSymbol(global);
         if (sym.undf()) continue;
         if (sym.n_desc == N_DESC_GCED) continue;
-        const match = self.section_ordinals.keys()[sym.n_sect - 1];
+        const match = self.getMatchingSectionFromOrdinal(sym.n_sect);
         if (match.seg != text_seg_index or match.sect != text_sect_index) continue;
 
         const offset = @intCast(u32, sym.n_value - text_seg.inner.vmaddr);
@@ -5816,8 +5809,10 @@ fn writeDices(self: *MachO) !void {
         atom = prev;
     }
 
-    const text_seg = self.load_commands.items[self.text_segment_cmd_index.?].segment;
-    const text_sect = text_seg.sections.items[self.text_section_index.?];
+    const text_sect = self.getSection(.{
+        .seg = self.text_segment_cmd_index.?,
+        .sect = self.text_section_index.?,
+    });
 
     while (true) {
         if (atom.dices.items.len > 0) {
@@ -6015,8 +6010,10 @@ fn writeSymbolTable(self: *MachO) !void {
 
     if (self.text_segment_cmd_index) |text_segment_cmd_index| blk: {
         const stubs_section_index = self.stubs_section_index orelse break :blk;
-        const text_segment = &self.load_commands.items[text_segment_cmd_index].segment;
-        const stubs = &text_segment.sections.items[stubs_section_index];
+        const stubs = self.getSectionPtr(.{
+            .seg = text_segment_cmd_index,
+            .sect = stubs_section_index,
+        });
         stubs.reserved1 = 0;
         for (self.stubs_table.keys()) |target| {
             const sym = self.getSymbol(target);
@@ -6027,8 +6024,10 @@ fn writeSymbolTable(self: *MachO) !void {
 
     if (self.data_const_segment_cmd_index) |data_const_segment_cmd_index| blk: {
         const got_section_index = self.got_section_index orelse break :blk;
-        const data_const_segment = &self.load_commands.items[data_const_segment_cmd_index].segment;
-        const got = &data_const_segment.sections.items[got_section_index];
+        const got = self.getSectionPtr(.{
+            .seg = data_const_segment_cmd_index,
+            .sect = got_section_index,
+        });
         got.reserved1 = nstubs;
         for (self.got_entries_table.keys()) |target| {
             const sym = self.getSymbol(target);
@@ -6042,8 +6041,10 @@ fn writeSymbolTable(self: *MachO) !void {
 
     if (self.data_segment_cmd_index) |data_segment_cmd_index| blk: {
         const la_symbol_ptr_section_index = self.la_symbol_ptr_section_index orelse break :blk;
-        const data_segment = &self.load_commands.items[data_segment_cmd_index].segment;
-        const la_symbol_ptr = &data_segment.sections.items[la_symbol_ptr_section_index];
+        const la_symbol_ptr = self.getSectionPtr(.{
+            .seg = data_segment_cmd_index,
+            .sect = la_symbol_ptr_section_index,
+        });
         la_symbol_ptr.reserved1 = nstubs + ngot_entries;
         for (self.stubs_table.keys()) |target| {
             const sym = self.getSymbol(target);
@@ -6231,6 +6232,35 @@ pub fn makeStaticString(bytes: []const u8) [16]u8 {
     return buf;
 }
 
+pub fn getSectionOrdinal(self: *MachO, match: MatchingSection) u8 {
+    return @intCast(u8, self.section_ordinals.getIndex(match).?) + 1;
+}
+
+pub fn getMatchingSectionFromOrdinal(self: *MachO, ord: u8) MatchingSection {
+    const index = ord - 1;
+    assert(index < self.section_ordinals.count());
+    return self.section_ordinals.keys()[index];
+}
+
+pub fn getSegmentPtr(self: *MachO, match: MatchingSection) *macho.SegmentCommand {
+    assert(match.seg < self.load_commands.items.len);
+    return &self.load_commands.items[match.seg].segment;
+}
+
+pub fn getSegment(self: *MachO, match: MatchingSection) macho.SegmentCommand {
+    return self.getSegmentPtr(match).*;
+}
+
+pub fn getSectionPtr(self: *MachO, match: MatchingSection) *macho.section_64 {
+    const seg = self.getSegmentPtr(match);
+    assert(match.sect < seg.sections.items.len);
+    return &seg.sections.items[match.sect];
+}
+
+pub fn getSection(self: *MachO, match: MatchingSection) macho.section_64 {
+    return self.getSectionPtr(match).*;
+}
+
 pub fn symbolIsTemp(self: *MachO, sym_with_loc: SymbolWithLoc) bool {
     const sym = self.getSymbol(sym_with_loc);
     if (!sym.sect()) return false;
@@ -6359,8 +6389,7 @@ fn snapshotState(self: *MachO) !void {
     var nodes = std.ArrayList(Snapshot.Node).init(arena);
 
     for (self.section_ordinals.keys()) |key| {
-        const seg = self.load_commands.items[key.seg].segment;
-        const sect = seg.sections.items[key.sect];
+        const sect = self.getSection(key);
         const sect_name = try std.fmt.allocPrint(arena, "{s},{s}", .{ sect.segName(), sect.sectName() });
         try nodes.append(.{
             .address = sect.addr,
@@ -6678,10 +6707,9 @@ fn logSymtab(self: *MachO) void {
     }
 }
 
-fn logSectionOrdinals(self: MachO) void {
+fn logSectionOrdinals(self: *MachO) void {
     for (self.section_ordinals.keys()) |match, i| {
-        const seg = self.load_commands.items[match.seg].segment;
-        const sect = seg.sections.items[match.sect];
+        const sect = self.getSection(match);
         log.warn("sectord({d}): {d},{d} => {s},{s}", .{
             i + 1,
             match.seg,
@@ -6703,8 +6731,7 @@ fn logAtoms(self: *MachO) void {
             atom = prev;
         }
 
-        const seg = self.load_commands.items[match.seg].segment;
-        const sect = seg.sections.items[match.sect];
+        const sect = self.getSection(match);
         log.warn("{s},{s}", .{ sect.segName(), sect.sectName() });
 
         while (true) {
