@@ -2168,7 +2168,11 @@ fn writeAtomsWhole(self: *MachO) !void {
                 break :blk math.cast(usize, size) orelse return error.Overflow;
             } else 0;
 
-            log.warn("  (adding atom {s} to buffer: {})", .{ atom.getName(self), this_sym });
+            log.warn("  (adding ATOM(%{d}, '{s}') from object({d}) to buffer)", .{
+                atom.sym_index,
+                atom.getName(self),
+                atom.file,
+            });
 
             try atom.resolveRelocs(self);
             buffer.appendSliceAssumeCapacity(atom.code.items);
