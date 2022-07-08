@@ -259,6 +259,13 @@ pub fn getName(self: Atom, macho_file: *MachO) []const u8 {
     });
 }
 
+pub fn getSymbolAt(self: Atom, macho_file: *MachO, sym_index: u32) macho.nlist_64 {
+    return macho_file.getSymbol(.{
+        .sym_index = sym_index,
+        .file = self.file,
+    });
+}
+
 /// Returns how much room there is to grow in virtual address space.
 /// File offset relocation happens transparently, so it is not included in
 /// this calculation.
@@ -756,7 +763,18 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
                 target_atom.getName(macho_file),
                 target_atom.file,
             });
-            const target_sym = target_atom.getSymbol(macho_file);
+            // TODO how can we clean this up?
+            // This is only ever needed if there are contained symbols in the Atom.
+            const target_sym: macho.nlist_64 = target_sym: {
+                if (target_atom.file) |afile| {
+                    if (rel.target.file) |tfile| {
+                        if (afile == tfile) {
+                            break :target_sym macho_file.getSymbol(rel.target);
+                        }
+                    }
+                }
+                break :target_sym target_atom.getSymbol(macho_file);
+            };
             const base_address: u64 = if (is_tlv) base_address: {
                 // For TLV relocations, the value specified as a relocation is the displacement from the
                 // TLV initializer (either value in __thread_data or zero-init in __thread_bss) to the first
