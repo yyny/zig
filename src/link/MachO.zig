@@ -1044,13 +1044,10 @@ pub fn flushModule(self: *MachO, comp: *Compilation, prog_node: *std.Progress.No
 
         try self.allocateSpecialSymbols();
 
-        if (build_options.enable_logging or true) {
+        if (build_options.enable_logging) {
             self.logSymtab();
-            log.warn("\n\n", .{});
             self.logSectionOrdinals();
-            log.warn("\n\n", .{});
             self.logAtoms();
-            log.warn("\n\n", .{});
         }
 
         if (use_llvm or use_stage1) {
@@ -2291,6 +2288,11 @@ pub fn createGotAtom(self: *MachO, target: SymbolWithLoc) !*Atom {
     try self.managed_atoms.append(gpa, atom);
     try self.atom_by_index_table.putNoClobber(gpa, sym_index, atom);
 
+    try self.allocateAtomCommon(atom, .{
+        .seg = self.data_const_segment_cmd_index.?,
+        .sect = self.got_section_index.?,
+    });
+
     return atom;
 }
 
@@ -2317,6 +2319,13 @@ pub fn createTlvPtrAtom(self: *MachO, target: SymbolWithLoc) !*Atom {
     try self.managed_atoms.append(gpa, atom);
     try self.atom_by_index_table.putNoClobber(gpa, sym_index, atom);
 
+    const match = (try self.getMatchingSection(.{
+        .segname = makeStaticString("__DATA"),
+        .sectname = makeStaticString("__thread_ptrs"),
+        .flags = macho.S_THREAD_LOCAL_VARIABLE_POINTERS,
+    })).?;
+    try self.allocateAtomCommon(atom, match);
+
     return atom;
 }
 
@@ -2326,27 +2335,20 @@ fn createDyldPrivateAtom(self: *MachO) !void {
 
     const gpa = self.base.allocator;
     const sym_index = @intCast(u32, self.locals.items.len);
-    const sym = try self.locals.addOne(gpa);
-    sym.* = .{
+    try self.locals.append(gpa, .{
         .n_strx = 0,
         .n_type = macho.N_SECT,
         .n_sect = 0,
         .n_desc = 0,
         .n_value = 0,
-    };
+    });
     const atom = try MachO.createEmptyAtom(gpa, sym_index, @sizeOf(u64), 3);
     self.dyld_private_atom = atom;
-    const match = MatchingSection{
+
+    try self.allocateAtomCommon(atom, .{
         .seg = self.data_segment_cmd_index.?,
         .sect = self.data_section_index.?,
-    };
-    if (self.needs_prealloc) {
-        const vaddr = try self.allocateAtom(atom, @sizeOf(u64), 8, match);
-        log.debug("allocated dyld private atom at 0x{x}", .{vaddr});
-        sym.n_value = vaddr;
-    } else try self.addAtomToSection(atom, match);
-
-    sym.n_sect = self.getSectionOrdinal(match);
+    });
 
     try self.managed_atoms.append(gpa, atom);
     try self.atom_by_index_table.putNoClobber(gpa, sym_index, atom);
@@ -2369,14 +2371,13 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
         else => unreachable,
     };
     const sym_index = @intCast(u32, self.locals.items.len);
-    const sym = try self.locals.addOne(gpa);
-    sym.* = .{
+    try self.locals.append(gpa, .{
         .n_strx = 0,
         .n_type = macho.N_SECT,
         .n_sect = 0,
         .n_desc = 0,
         .n_value = 0,
-    };
+    });
     const atom = try MachO.createEmptyAtom(gpa, sym_index, size, alignment);
     const dyld_private_sym_index = self.dyld_private_atom.?.sym_index;
     switch (arch) {
@@ -2474,19 +2475,11 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
         else => unreachable,
     }
     self.stub_helper_preamble_atom = atom;
-    const match = MatchingSection{
+
+    try self.allocateAtomCommon(atom, .{
         .seg = self.text_segment_cmd_index.?,
         .sect = self.stub_helper_section_index.?,
-    };
-
-    if (self.needs_prealloc) {
-        const alignment_pow_2 = try math.powi(u32, 2, atom.alignment);
-        const vaddr = try self.allocateAtom(atom, atom.size, alignment_pow_2, match);
-        log.debug("allocated stub helper preamble atom at 0x{x}", .{vaddr});
-        sym.n_value = vaddr;
-    } else try self.addAtomToSection(atom, match);
-
-    sym.n_sect = self.getSectionOrdinal(match);
+    });
 
     try self.managed_atoms.append(gpa, atom);
     try self.atom_by_index_table.putNoClobber(gpa, sym_index, atom);
@@ -2562,6 +2555,11 @@ pub fn createStubHelperAtom(self: *MachO) !*Atom {
     try self.managed_atoms.append(gpa, atom);
     try self.atom_by_index_table.putNoClobber(gpa, sym_index, atom);
 
+    try self.allocateAtomCommon(atom, .{
+        .seg = self.text_segment_cmd_index.?,
+        .sect = self.stub_helper_section_index.?,
+    });
+
     return atom;
 }
 
@@ -2598,6 +2596,11 @@ pub fn createLazyPointerAtom(self: *MachO, stub_sym_index: u32, target: SymbolWi
 
     try self.managed_atoms.append(gpa, atom);
     try self.atom_by_index_table.putNoClobber(gpa, sym_index, atom);
+
+    try self.allocateAtomCommon(atom, .{
+        .seg = self.data_segment_cmd_index.?,
+        .sect = self.la_symbol_ptr_section_index.?,
+    });
 
     return atom;
 }
@@ -2676,6 +2679,11 @@ pub fn createStubAtom(self: *MachO, laptr_sym_index: u32) !*Atom {
     try self.managed_atoms.append(gpa, atom);
     try self.atom_by_index_table.putNoClobber(gpa, sym_index, atom);
 
+    try self.allocateAtomCommon(atom, .{
+        .seg = self.text_segment_cmd_index.?,
+        .sect = self.stubs_section_index.?,
+    });
+
     return atom;
 }
 
@@ -2700,18 +2708,13 @@ fn createTentativeDefAtoms(self: *MachO) !void {
         sym.* = .{
             .n_strx = sym.n_strx,
             .n_type = macho.N_SECT,
-            .n_sect = self.getSectionOrdinal(match),
+            .n_sect = 0,
             .n_desc = 0,
             .n_value = 0,
         };
 
         const atom = try MachO.createEmptyAtom(gpa, global.sym_index, size, alignment);
-
-        if (self.needs_prealloc) {
-            const alignment_pow_2 = try math.powi(u32, 2, alignment);
-            const vaddr = try self.allocateAtom(atom, size, alignment_pow_2, match);
-            sym.n_value = vaddr;
-        } else try self.addAtomToSection(atom, match);
+        try self.allocateAtomCommon(atom, match);
 
         if (global.file) |file| {
             const object = &self.objects.items[file];
@@ -3025,22 +3028,8 @@ fn resolveDyldStubBinder(self: *MachO) !void {
 
     // Add dyld_stub_binder as the final GOT entry.
     const got_index = try self.allocateGotEntry(global);
-    const atom = try self.createGotAtom(global);
-    self.got_entries.items[got_index].atom = atom;
-
-    const match = MatchingSection{
-        .seg = self.data_const_segment_cmd_index.?,
-        .sect = self.got_section_index.?,
-    };
-    const atom_sym = atom.getSymbolPtr(self);
-
-    if (self.needs_prealloc) {
-        const vaddr = try self.allocateAtom(atom, @sizeOf(u64), 8, match);
-        log.debug("allocated {s} atom at 0x{x}", .{ sym_name, vaddr });
-        atom_sym.n_value = vaddr;
-    } else try self.addAtomToSection(atom, match);
-
-    atom_sym.n_sect = self.getSectionOrdinal(match);
+    const got_atom = try self.createGotAtom(global);
+    self.got_entries.items[got_index].atom = got_atom;
 }
 
 fn addLoadDylibLC(self: *MachO, id: u16) !void {
@@ -3364,9 +3353,7 @@ pub fn allocateDeclIndexes(self: *MachO, decl_index: Module.Decl.Index) !void {
     try self.decls.putNoClobber(self.base.allocator, decl_index, null);
 
     const got_target = .{ .sym_index = decl.link.macho.sym_index, .file = null };
-    const got_index = try self.allocateGotEntry(got_target);
-    const got_atom = try self.createGotAtom(got_target);
-    self.got_entries.items[got_index].atom = got_atom;
+    _ = try self.allocateGotEntry(got_target);
 }
 
 pub fn updateFunc(self: *MachO, module: *Module, func: *Module.Fn, air: Air, liveness: Liveness) !void {
@@ -3808,18 +3795,14 @@ fn placeDecl(self: *MachO, decl_index: Module.Decl.Index, code_len: usize) !*mac
             .n_desc = 0,
             .n_value = addr,
         };
-        const got_index = self.got_entries_table.get(.{ .sym_index = decl.link.macho.sym_index, .file = null }).?;
-        const got_atom = self.got_entries.items[got_index].atom;
-        const got_sym = &self.locals.items[got_atom.sym_index];
-        const vaddr = try self.allocateAtom(got_atom, @sizeOf(u64), 8, .{
-            .seg = self.data_const_segment_cmd_index.?,
-            .sect = self.got_section_index.?,
-        });
-        got_sym.n_value = vaddr;
-        got_sym.n_sect = self.getSectionOrdinal(.{
-            .seg = self.data_const_segment_cmd_index.?,
-            .sect = self.got_section_index.?,
-        });
+
+        const got_target = SymbolWithLoc{
+            .sym_index = decl.link.macho.sym_index,
+            .file = null,
+        };
+        const got_index = self.got_entries_table.get(got_target).?;
+        const got_atom = try self.createGotAtom(got_target);
+        self.got_entries.items[got_index].atom = got_atom;
     }
 
     return symbol;
@@ -4984,7 +4967,26 @@ fn getSectionMaxAlignment(self: *MachO, segment_id: u16, start_sect_id: u16) !u3
     return max_alignment;
 }
 
-pub fn allocateAtom(self: *MachO, atom: *Atom, new_atom_size: u64, alignment: u64, match: MatchingSection) !u64 {
+fn allocateAtomCommon(self: *MachO, atom: *Atom, match: MatchingSection) !void {
+    const sym = atom.getSymbolPtr(self);
+    if (self.needs_prealloc) {
+        const size = atom.size;
+        const alignment = try math.powi(u32, 2, atom.alignment);
+        const vaddr = try self.allocateAtom(atom, size, alignment, match);
+        const sym_name = atom.getName(self);
+        log.debug("allocated {s} atom at 0x{x}", .{ sym_name, vaddr });
+        sym.n_value = vaddr;
+    } else try self.addAtomToSection(atom, match);
+    sym.n_sect = self.getSectionOrdinal(match);
+}
+
+fn allocateAtom(
+    self: *MachO,
+    atom: *Atom,
+    new_atom_size: u64,
+    alignment: u64,
+    match: MatchingSection,
+) !u64 {
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -6659,16 +6661,16 @@ pub fn logSymAttributes(sym: macho.nlist_64, buf: *[4]u8) []const u8 {
 fn logSymtab(self: *MachO) void {
     var buf: [4]u8 = undefined;
 
-    log.warn("symtab:", .{});
+    log.debug("symtab:", .{});
     for (self.objects.items) |object, id| {
-        log.warn("  object({d}): {s}", .{ id, object.name });
+        log.debug("  object({d}): {s}", .{ id, object.name });
         for (object.symtab.items) |sym, sym_id| {
             const where = if (sym.undf() and !sym.tentative()) "ord" else "sect";
             const def_index = if (sym.undf() and !sym.tentative())
                 @divTrunc(sym.n_desc, macho.N_SYMBOL_RESOLVER)
             else
                 sym.n_sect;
-            log.warn("    %{d}: {s} @{x} in {s}({d}), {s}", .{
+            log.debug("    %{d}: {s} @{x} in {s}({d}), {s}", .{
                 sym_id,
                 object.getString(sym.n_strx),
                 sym.n_value,
@@ -6678,14 +6680,14 @@ fn logSymtab(self: *MachO) void {
             });
         }
     }
-    log.warn("  object(null)", .{});
+    log.debug("  object(null)", .{});
     for (self.locals.items) |sym, sym_id| {
         const where = if (sym.undf() and !sym.tentative()) "ord" else "sect";
         const def_index = if (sym.undf() and !sym.tentative())
             @divTrunc(sym.n_desc, macho.N_SYMBOL_RESOLVER)
         else
             sym.n_sect;
-        log.warn("    %{d}: {s} @{x} in {s}({d}), {s}", .{
+        log.debug("    %{d}: {s} @{x} in {s}({d}), {s}", .{
             sym_id,
             self.strtab.get(sym.n_strx),
             sym.n_value,
@@ -6695,13 +6697,13 @@ fn logSymtab(self: *MachO) void {
         });
     }
 
-    log.warn("globals table:", .{});
+    log.debug("globals table:", .{});
     for (self.globals.keys()) |name, id| {
         const value = self.globals.values()[id];
-        log.warn("  {s} => %{d} in object({d})", .{ name, value.sym_index, value.file });
+        log.debug("  {s} => %{d} in object({d})", .{ name, value.sym_index, value.file });
     }
 
-    log.warn("GOT entries:", .{});
+    log.debug("GOT entries:", .{});
     for (self.got_entries_table.values()) |value| {
         const target = self.got_entries.items[value].target;
         const target_sym = self.getSymbol(target);
@@ -6709,9 +6711,9 @@ fn logSymtab(self: *MachO) void {
         const atom_sym = atom.getSymbol(self);
 
         if (target_sym.undf()) {
-            log.warn("  {d}@{x} => import('{s}')", .{ value, atom_sym.n_value, self.getSymbolName(target) });
+            log.debug("  {d}@{x} => import('{s}')", .{ value, atom_sym.n_value, self.getSymbolName(target) });
         } else {
-            log.warn("  {d}@{x} => local(%{d}) in object({d})", .{
+            log.debug("  {d}@{x} => local(%{d}) in object({d})", .{
                 value,
                 atom_sym.n_value,
                 target.sym_index,
@@ -6720,36 +6722,36 @@ fn logSymtab(self: *MachO) void {
         }
     }
 
-    log.warn("__thread_ptrs entries:", .{});
+    log.debug("__thread_ptrs entries:", .{});
     for (self.tlv_ptr_entries_table.values()) |value| {
         const target = self.tlv_ptr_entries.items[value].target;
         const target_sym = self.getSymbol(target);
         const atom = self.tlv_ptr_entries.items[value].atom;
         const atom_sym = atom.getSymbol(self);
         assert(target_sym.undf());
-        log.warn("  {d}@{x} => import('{s}')", .{ value, atom_sym.n_value, self.getSymbolName(target) });
+        log.debug("  {d}@{x} => import('{s}')", .{ value, atom_sym.n_value, self.getSymbolName(target) });
     }
 
-    log.warn("stubs entries:", .{});
+    log.debug("stubs entries:", .{});
     for (self.stubs_table.values()) |value| {
         const target = self.stubs.items[value].target;
         const target_sym = self.getSymbol(target);
         const atom = self.stubs.items[value].atom;
         const atom_sym = atom.getSymbol(self);
         assert(target_sym.undf());
-        log.warn("  {d}@{x} => import('{s}')", .{ value, atom_sym.n_value, self.getSymbolName(target) });
+        log.debug("  {d}@{x} => import('{s}')", .{ value, atom_sym.n_value, self.getSymbolName(target) });
     }
 }
 
 fn logSectionOrdinals(self: *MachO) void {
     for (self.section_ordinals.keys()) |match, i| {
         const sect = self.getSection(match);
-        log.warn("sect({d}, '{s},{s}')", .{ i + 1, sect.segName(), sect.sectName() });
+        log.debug("sect({d}, '{s},{s}')", .{ i + 1, sect.segName(), sect.sectName() });
     }
 }
 
 fn logAtoms(self: *MachO) void {
-    log.warn("atoms:", .{});
+    log.debug("atoms:", .{});
     var it = self.atoms.iterator();
     while (it.next()) |entry| {
         const match = entry.key_ptr.*;
@@ -6760,7 +6762,7 @@ fn logAtoms(self: *MachO) void {
         }
 
         const sect = self.getSection(match);
-        log.warn("{s},{s}", .{ sect.segName(), sect.sectName() });
+        log.debug("{s},{s}", .{ sect.segName(), sect.sectName() });
 
         while (true) {
             self.logAtom(atom);
@@ -6775,7 +6777,7 @@ fn logAtoms(self: *MachO) void {
 pub fn logAtom(self: *MachO, atom: *const Atom) void {
     const sym = atom.getSymbol(self);
     const sym_name = atom.getName(self);
-    log.warn("  ATOM(%{d}, '{s}') @ {x} in object({d})", .{
+    log.debug("  ATOM(%{d}, '{s}') @ {x} in object({d})", .{
         atom.sym_index,
         sym_name,
         sym.n_value,
@@ -6788,7 +6790,7 @@ pub fn logAtom(self: *MachO, atom: *const Atom) void {
             .file = atom.file,
         });
         const inner_sym_name = self.getSymbolName(.{ .sym_index = sym_off.sym_index, .file = atom.file });
-        log.warn("    (%{d}, '{s}') @ {x} ({x}) in object({d})", .{
+        log.debug("    (%{d}, '{s}') @ {x} ({x}) in object({d})", .{
             sym_off.sym_index,
             inner_sym_name,
             inner_sym.n_value,

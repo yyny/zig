@@ -168,7 +168,7 @@ pub fn parse(self: *Object, allocator: Allocator, target: std.Target) !void {
 
     self.header = try reader.readStruct(macho.mach_header_64);
     if (self.header.filetype != macho.MH_OBJECT) {
-        log.warn("invalid filetype: expected 0x{x}, found 0x{x}", .{
+        log.debug("invalid filetype: expected 0x{x}, found 0x{x}", .{
             macho.MH_OBJECT,
             self.header.filetype,
         });
@@ -245,7 +245,7 @@ pub fn parse(self: *Object, allocator: Allocator, target: std.Target) !void {
                 cmd.linkedit_data.dataoff += file_offset;
             },
             else => {
-                log.warn("Unknown load command detected: 0x{x}.", .{cmd.cmd()});
+                log.debug("Unknown load command detected: 0x{x}.", .{cmd.cmd()});
             },
         }
         self.load_commands.appendAssumeCapacity(cmd);

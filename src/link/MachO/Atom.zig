@@ -593,24 +593,6 @@ fn addTlvPtrEntry(target: MachO.SymbolWithLoc, context: RelocContext) !void {
     const index = try context.macho_file.allocateTlvPtrEntry(target);
     const atom = try context.macho_file.createTlvPtrAtom(target);
     context.macho_file.tlv_ptr_entries.items[index].atom = atom;
-
-    const match = (try context.macho_file.getMatchingSection(.{
-        .segname = MachO.makeStaticString("__DATA"),
-        .sectname = MachO.makeStaticString("__thread_ptrs"),
-        .flags = macho.S_THREAD_LOCAL_VARIABLE_POINTERS,
-    })).?;
-    const sym = atom.getSymbolPtr(context.macho_file);
-
-    if (context.macho_file.needs_prealloc) {
-        const size = atom.size;
-        const alignment = try math.powi(u32, 2, atom.alignment);
-        const vaddr = try context.macho_file.allocateAtom(atom, size, alignment, match);
-        const sym_name = atom.getName(context.macho_file);
-        log.debug("allocated {s} atom at 0x{x}", .{ sym_name, vaddr });
-        sym.n_value = vaddr;
-    } else try context.macho_file.addAtomToSection(atom, match);
-
-    sym.n_sect = context.macho_file.getSectionOrdinal(match);
 }
 
 fn addGotEntry(target: MachO.SymbolWithLoc, context: RelocContext) !void {
@@ -619,23 +601,6 @@ fn addGotEntry(target: MachO.SymbolWithLoc, context: RelocContext) !void {
     const index = try context.macho_file.allocateGotEntry(target);
     const atom = try context.macho_file.createGotAtom(target);
     context.macho_file.got_entries.items[index].atom = atom;
-
-    const match = MachO.MatchingSection{
-        .seg = context.macho_file.data_const_segment_cmd_index.?,
-        .sect = context.macho_file.got_section_index.?,
-    };
-    const sym = atom.getSymbolPtr(context.macho_file);
-
-    if (context.macho_file.needs_prealloc) {
-        const size = atom.size;
-        const alignment = try math.powi(u32, 2, atom.alignment);
-        const vaddr = try context.macho_file.allocateAtom(atom, size, alignment, match);
-        const sym_name = atom.getName(context.macho_file);
-        log.debug("allocated {s} atom at 0x{x}", .{ sym_name, vaddr });
-        sym.n_value = vaddr;
-    } else try context.macho_file.addAtomToSection(atom, match);
-
-    sym.n_sect = context.macho_file.getSectionOrdinal(match);
 }
 
 fn addStub(target: MachO.SymbolWithLoc, context: RelocContext) !void {
@@ -644,84 +609,24 @@ fn addStub(target: MachO.SymbolWithLoc, context: RelocContext) !void {
     if (context.macho_file.stubs_table.contains(target)) return;
 
     const stub_index = try context.macho_file.allocateStubEntry(target);
+    const stub_helper_atom = try context.macho_file.createStubHelperAtom();
+    const laptr_atom = try context.macho_file.createLazyPointerAtom(stub_helper_atom.sym_index, target);
+    const stub_atom = try context.macho_file.createStubAtom(laptr_atom.sym_index);
 
-    // TODO clean this up!
-    const stub_helper_atom = atom: {
-        const atom = try context.macho_file.createStubHelperAtom();
-        const match = MachO.MatchingSection{
-            .seg = context.macho_file.text_segment_cmd_index.?,
-            .sect = context.macho_file.stub_helper_section_index.?,
-        };
-        const sym = atom.getSymbolPtr(context.macho_file);
-
-        if (context.macho_file.needs_prealloc) {
-            const size = atom.size;
-            const alignment = try math.powi(u32, 2, atom.alignment);
-            const vaddr = try context.macho_file.allocateAtom(atom, size, alignment, match);
-            const sym_name = atom.getName(context.macho_file);
-            log.debug("allocated {s} atom at 0x{x}", .{ sym_name, vaddr });
-            sym.n_value = vaddr;
-        } else try context.macho_file.addAtomToSection(atom, match);
-
-        sym.n_sect = context.macho_file.getSectionOrdinal(match);
-
-        break :atom atom;
-    };
-
-    const laptr_atom = atom: {
-        const atom = try context.macho_file.createLazyPointerAtom(stub_helper_atom.sym_index, target);
-        const match = MachO.MatchingSection{
-            .seg = context.macho_file.data_segment_cmd_index.?,
-            .sect = context.macho_file.la_symbol_ptr_section_index.?,
-        };
-        const sym = atom.getSymbolPtr(context.macho_file);
-
-        if (context.macho_file.needs_prealloc) {
-            const size = atom.size;
-            const alignment = try math.powi(u32, 2, atom.alignment);
-            const vaddr = try context.macho_file.allocateAtom(atom, size, alignment, match);
-            const sym_name = atom.getName(context.macho_file);
-            log.debug("allocated {s} atom at 0x{x}", .{ sym_name, vaddr });
-            sym.n_value = vaddr;
-        } else try context.macho_file.addAtomToSection(atom, match);
-
-        sym.n_sect = context.macho_file.getSectionOrdinal(match);
-
-        break :atom atom;
-    };
-
-    const atom = try context.macho_file.createStubAtom(laptr_atom.sym_index);
-    const match = MachO.MatchingSection{
-        .seg = context.macho_file.text_segment_cmd_index.?,
-        .sect = context.macho_file.stubs_section_index.?,
-    };
-    const sym = atom.getSymbolPtr(context.macho_file);
-
-    if (context.macho_file.needs_prealloc) {
-        const size = atom.size;
-        const alignment = try math.powi(u32, 2, atom.alignment);
-        const vaddr = try context.macho_file.allocateAtom(atom, size, alignment, match);
-        const sym_name = atom.getName(context.macho_file);
-        log.debug("allocated {s} atom at 0x{x}", .{ sym_name, vaddr });
-        sym.n_value = vaddr;
-    } else try context.macho_file.addAtomToSection(atom, match);
-
-    sym.n_sect = context.macho_file.getSectionOrdinal(match);
-
-    context.macho_file.stubs.items[stub_index].atom = atom;
+    context.macho_file.stubs.items[stub_index].atom = stub_atom;
 }
 
 pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
-    log.warn("ATOM(%{d}, '{s}')", .{ self.sym_index, self.getName(macho_file) });
+    log.debug("ATOM(%{d}, '{s}')", .{ self.sym_index, self.getName(macho_file) });
 
     for (self.relocs.items) |rel| {
         const arch = macho_file.base.options.target.cpu.arch;
         switch (arch) {
             .aarch64 => {
-                log.warn("  RELA({s}) @ {x} => %{d} in object({d})", .{
+                log.debug("  RELA({s}) @ {x} => %{d} in object({d})", .{
                     @tagName(@intToEnum(macho.reloc_type_arm64, rel.@"type")),
                     rel.offset,
                     rel.target.sym_index,
@@ -729,7 +634,7 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
                 });
             },
             .x86_64 => {
-                log.warn("  RELA({s}) @ {x} => %{d} in object({d})", .{
+                log.debug("  RELA({s}) @ {x} => %{d} in object({d})", .{
                     @tagName(@intToEnum(macho.reloc_type_x86_64, rel.@"type")),
                     rel.offset,
                     rel.target.sym_index,
@@ -756,13 +661,13 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
                 const target_name = macho_file.getSymbolName(rel.target);
                 if (macho_file.globals.contains(target_name)) {
                     const atomless_sym = macho_file.getSymbol(rel.target);
-                    log.warn("    | atomless target '{s}'", .{target_name});
+                    log.debug("    | atomless target '{s}'", .{target_name});
                     break :blk atomless_sym.n_value;
                 }
-                log.warn("    | undef target '{s}'", .{target_name});
+                log.debug("    | undef target '{s}'", .{target_name});
                 break :blk 0;
             };
-            log.warn("    | target ATOM(%{d}, '{s}') in object({d})", .{
+            log.debug("    | target ATOM(%{d}, '{s}') in object({d})", .{
                 target_atom.sym_index,
                 target_atom.getName(macho_file),
                 target_atom.file,
@@ -798,8 +703,8 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
             break :blk target_sym.n_value - base_address;
         };
 
-        log.warn("    | source_addr = 0x{x}", .{source_addr});
-        log.warn("    | target_addr = 0x{x}", .{target_addr});
+        log.debug("    | source_addr = 0x{x}", .{source_addr});
+        log.debug("    | target_addr = 0x{x}", .{target_addr});
 
         switch (arch) {
             .aarch64 => {
