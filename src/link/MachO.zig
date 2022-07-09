@@ -2694,6 +2694,10 @@ fn createTentativeDefAtoms(self: *MachO) !void {
         const sym = self.getSymbolPtr(global);
         if (!sym.tentative()) continue;
 
+        log.debug("creating tentative definition for ATOM(%{d}, '{s}') in object({d})", .{
+            global.sym_index, self.getSymbolName(global), global.file,
+        });
+
         // Convert any tentative definition into a regular symbol and allocate
         // text blocks for each tentative definition.
         const match = MatchingSection{
@@ -2707,17 +2711,26 @@ fn createTentativeDefAtoms(self: *MachO) !void {
 
         sym.* = .{
             .n_strx = sym.n_strx,
-            .n_type = macho.N_SECT,
+            .n_type = macho.N_SECT | macho.N_EXT,
             .n_sect = 0,
             .n_desc = 0,
             .n_value = 0,
         };
 
         const atom = try MachO.createEmptyAtom(gpa, global.sym_index, size, alignment);
+        atom.file = global.file;
+
         try self.allocateAtomCommon(atom, match);
 
         if (global.file) |file| {
             const object = &self.objects.items[file];
+
+            try atom.contained.append(gpa, .{
+                .sym_index = global.sym_index,
+                .offset = 0,
+                .stab = if (object.debug_info) |_| .static else null,
+            });
+
             try object.managed_atoms.append(gpa, atom);
             try object.atom_by_index_table.putNoClobber(gpa, global.sym_index, atom);
         } else {
@@ -2867,7 +2880,7 @@ fn resolveSymbolsInObject(self: *MachO, object: *Object, object_id: u16) !void {
         if (sym.tentative() and global_sym.tentative()) {
             if (global_sym.n_value >= sym.n_value) continue;
         }
-        if (sym.undf()) continue;
+        if (sym.undf() and !sym.tentative()) continue;
 
         _ = self.unresolved.swapRemove(@intCast(u32, self.globals.getIndex(name).?));
 
@@ -5941,11 +5954,21 @@ fn writeSymbolTable(self: *MachO) !void {
                 for (object.managed_atoms.items) |atom| {
                     for (atom.contained.items) |sym_at_off| {
                         const stab = sym_at_off.stab orelse continue;
+                        const sym_loc = SymbolWithLoc{
+                            .sym_index = sym_at_off.sym_index,
+                            .file = atom.file,
+                        };
+                        const sym = self.getSymbol(sym_loc);
+                        if (sym.n_strx == 0) continue;
+                        if (sym.n_desc == N_DESC_GCED) continue;
+                        if (self.symbolIsTemp(sym_loc)) continue;
+
                         const nlists = try stab.asNlists(.{
                             .sym_index = sym_at_off.sym_index,
                             .file = atom.file,
                         }, self);
                         defer gpa.free(nlists);
+
                         try locals.appendSlice(nlists);
                     }
                 }
