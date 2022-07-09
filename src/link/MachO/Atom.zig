@@ -251,17 +251,21 @@ pub fn getSymbolPtr(self: Atom, macho_file: *MachO) *macho.nlist_64 {
     });
 }
 
+/// Returns true if the symbol pointed at with `sym_loc` is contained within this atom.
+/// WARNING this function assumes all atoms have been allocated in the virtual memory.
+/// Calling it without allocating with `MachO.allocateSymbols` (or equivalent) will
+/// give bogus results.
+pub fn isSymbolContained(self: Atom, sym_loc: SymbolWithLoc, macho_file: *MachO) bool {
+    const sym = macho_file.getSymbol(sym_loc);
+    if (!sym.sect()) return false;
+    const self_sym = self.getSymbol(macho_file);
+    return sym.n_value >= self_sym.n_value and sym.n_value < self_sym.n_value + self.size;
+}
+
 /// Returns the name of this atom.
 pub fn getName(self: Atom, macho_file: *MachO) []const u8 {
     return macho_file.getSymbolName(.{
         .sym_index = self.sym_index,
-        .file = self.file,
-    });
-}
-
-pub fn getSymbolAt(self: Atom, macho_file: *MachO, sym_index: u32) macho.nlist_64 {
-    return macho_file.getSymbol(.{
-        .sym_index = sym_index,
         .file = self.file,
     });
 }
@@ -763,18 +767,11 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
                 target_atom.getName(macho_file),
                 target_atom.file,
             });
-            // TODO how can we clean this up?
-            // This is only ever needed if there are contained symbols in the Atom.
-            const target_sym: macho.nlist_64 = target_sym: {
-                if (target_atom.file) |afile| {
-                    if (rel.target.file) |tfile| {
-                        if (afile == tfile) {
-                            break :target_sym macho_file.getSymbol(rel.target);
-                        }
-                    }
-                }
-                break :target_sym target_atom.getSymbol(macho_file);
-            };
+            // If `rel.target` is contained within the target atom, pull its address value.
+            const target_sym = if (target_atom.isSymbolContained(rel.target, macho_file))
+                macho_file.getSymbol(rel.target)
+            else
+                target_atom.getSymbol(macho_file);
             const base_address: u64 = if (is_tlv) base_address: {
                 // For TLV relocations, the value specified as a relocation is the displacement from the
                 // TLV initializer (either value in __thread_data or zero-init in __thread_bss) to the first
